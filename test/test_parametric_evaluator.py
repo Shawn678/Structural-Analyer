@@ -1,6 +1,11 @@
 import sys, os
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
-from core.parametric_evaluator import build_geometry_fingerprint, evaluate_real_results
+from core.parametric_evaluator import (
+    build_geometry_fingerprint,
+    evaluate_real_results,
+    export_cache_to_txt,
+    import_cache_from_txt,
+)
 
 TRUSS_DATA = {
     "nodes": [
@@ -109,3 +114,53 @@ def test_evaluate_reaction_sum_equals_load():
     total_ry = sum(r["Ry"]["value"] for r in reactions if r["Ry"]["value"] is not None)
     # 靜力平衡：支承 Y 方向反力總和 = 外力 P=1
     assert abs(total_ry - 1.0) < 1e-3
+
+
+# ── Task 3: export_cache_to_txt / import_cache_from_txt ───────────────────────
+
+def test_export_txt_contains_sections():
+    cache = {}
+    evaluate_real_results(BEAM_DATA, REAL_PARAMS, symbolic_cache=cache)
+    txt = export_cache_to_txt(cache)
+    assert "[FINGERPRINT]" in txt
+    assert "[FORMULAS]" in txt
+    assert "[END]" in txt
+    assert "n_elements=2" in txt
+
+def test_export_txt_contains_formulas():
+    cache = {}
+    evaluate_real_results(BEAM_DATA, REAL_PARAMS, symbolic_cache=cache)
+    txt = export_cache_to_txt(cache)
+    assert "node_1_ux=" in txt
+    assert "elem_1_N=" in txt
+    assert "react_" in txt
+
+def test_import_txt_roundtrip():
+    cache = {}
+    evaluate_real_results(BEAM_DATA, REAL_PARAMS, symbolic_cache=cache)
+    txt = export_cache_to_txt(cache)
+    imported = import_cache_from_txt(txt, BEAM_DATA)
+    assert "error" not in imported
+    assert "raw_result" in imported
+    assert "elem_Ls" in imported
+    assert "fingerprint" in imported
+
+def test_import_txt_fingerprint_mismatch():
+    cache = {}
+    evaluate_real_results(BEAM_DATA, REAL_PARAMS, symbolic_cache=cache)
+    txt = export_cache_to_txt(cache)
+    # 修改幾何
+    import copy
+    different_data = copy.deepcopy(BEAM_DATA)
+    different_data["nodes"][1]["x"] = 4.0  # 改中點位置
+    result = import_cache_from_txt(txt, different_data)
+    assert "error" in result
+    assert "桿件" in result["error"] or "長度" in result["error"] or "不符" in result["error"]
+
+def test_import_cache_enables_fast_eval():
+    cache = {}
+    evaluate_real_results(BEAM_DATA, REAL_PARAMS, symbolic_cache=cache)
+    txt = export_cache_to_txt(cache)
+    imported = import_cache_from_txt(txt, BEAM_DATA)
+    res = evaluate_real_results(BEAM_DATA, REAL_PARAMS, symbolic_cache=imported)
+    assert res["cache_used"] is True

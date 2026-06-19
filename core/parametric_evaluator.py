@@ -146,3 +146,149 @@ def evaluate_real_results(
         "cache_used":         cache_used,
         "eval_time_ms":       eval_ms,
     }
+
+
+def export_cache_to_txt(symbolic_cache: dict) -> str:
+    """
+    將 symbolic_cache 序列化為人類可讀 TXT 字串。
+    呼叫方負責寫檔或透過 Streamlit 下載。
+    """
+    fp = symbolic_cache.get("fingerprint", {})
+    raw = symbolic_cache.get("raw_result", {})
+    elem_Ls = symbolic_cache.get("elem_Ls", [])
+    timestamp = symbolic_cache.get("timestamp", datetime.now().strftime("%Y-%m-%dT%H:%M"))
+
+    lines = [
+        "# TRUSS SYMBOLIC CACHE v1",
+        f"# Generated: {timestamp}",
+        "[FINGERPRINT]",
+        f"n_elements={fp.get('n_elements', len(elem_Ls))}",
+        f"elem_lengths={','.join(fp.get('elem_lengths', [f'{L:.6f}' for L in elem_Ls]))}",
+        f"connections={','.join(fp.get('connections', []))}",
+        f"supports={'|'.join(fp.get('supports', []))}",
+        "[FORMULAS]",
+    ]
+
+    for nd in raw.get("node_displacements", []):
+        nid = nd["node_id"]
+        for key in ("ux", "uy", "uz", "theta_x", "theta_y", "theta_z"):
+            lines.append(f"node_{nid}_{key}={nd.get(key, '0')}")
+
+    for ef in raw.get("element_forces", []):
+        eid = ef["element_id"]
+        eqs = ef.get("equations", {})
+        for sym_key, out_key in [("N(x)","N"), ("V2(x)","V2"), ("V3(x)","V3"),
+                                   ("M3(x)","M3"), ("M2(x)","M2")]:
+            lines.append(f"elem_{eid}_{out_key}={eqs.get(sym_key, '0')}")
+
+    for sr in raw.get("support_reactions", []):
+        nid = sr["node_id"]
+        for key in ("Rx", "Ry", "Rz", "Mx", "My", "Mz"):
+            lines.append(f"react_{nid}_{key}={sr.get(key, '0')}")
+
+    lines.append("[END]")
+    return "\n".join(lines)
+
+
+def import_cache_from_txt(txt_content: str, truss_data: dict) -> dict:
+    """
+    從 TXT 字串重建 symbolic_cache 並驗證指紋。
+    成功：回傳可直接傳入 evaluate_real_results 的 cache dict。
+    失敗：回傳 {"error": "說明文字"}。
+    """
+    if "[FINGERPRINT]" not in txt_content or "[FORMULAS]" not in txt_content:
+        return {"error": "TXT 格式無效，缺少 [FINGERPRINT] 或 [FORMULAS] 區塊"}
+    if "[END]" not in txt_content:
+        return {"error": "TXT 格式無效，缺少 [END] 標記（檔案可能損壞）"}
+
+    # ── 解析區塊 ──────────────────────────────────────────────────────────
+    sections = {}
+    current = None
+    for line in txt_content.splitlines():
+        line = line.strip()
+        if line.startswith("#") or not line:
+            continue
+        if line.startswith("[") and line.endswith("]"):
+            current = line[1:-1]
+            sections[current] = []
+        elif current:
+            sections[current].append(line)
+
+    # ── 解析指紋 ──────────────────────────────────────────────────────────
+    fp_lines = {kv.split("=", 1)[0]: kv.split("=", 1)[1]
+                for kv in sections.get("FINGERPRINT", []) if "=" in kv}
+
+    cached_fp = {
+        "n_elements": int(fp_lines.get("n_elements", 0)),
+        "elem_lengths": fp_lines.get("elem_lengths", "").split(","),
+        "connections":  fp_lines.get("connections", "").split(","),
+        "supports":     [s for s in fp_lines.get("supports", "").split("|") if s],
+    }
+
+    # ── 比對指紋 ──────────────────────────────────────────────────────────
+    current_fp = build_geometry_fingerprint(truss_data)
+
+    if cached_fp["n_elements"] != current_fp["n_elements"]:
+        return {"error": f"桿件數量不符：快取 {cached_fp['n_elements']} 根 vs 當前 {current_fp['n_elements']} 根"}
+
+    for k, (ca, cu) in enumerate(zip(cached_fp["elem_lengths"], current_fp["elem_lengths"])):
+        if ca != cu:
+            return {"error": f"桿件 {k+1} 長度不符：快取 {ca} m vs 當前 {cu} m"}
+
+    for k, (ca, cu) in enumerate(zip(cached_fp["connections"], current_fp["connections"])):
+        if ca != cu:
+            return {"error": f"桿件 {k+1} 連接不符：快取 {ca} vs 當前 {cu}"}
+
+    cached_sup_set = set(cached_fp["supports"])
+    current_sup_set = set(current_fp["supports"])
+    if cached_sup_set != current_sup_set:
+        diff = cached_sup_set.symmetric_difference(current_sup_set)
+        return {"error": f"支承條件不符，差異：{', '.join(sorted(diff))}"}
+
+    # ── 解析公式，重建 raw_result ─────────────────────────────────────────
+    formulas = {}
+    for kv in sections.get("FORMULAS", []):
+        if "=" in kv:
+            k, v = kv.split("=", 1)
+            formulas[k.strip()] = v.strip()
+
+    node_ids = sorted({int(k.split("_")[1]) for k in formulas if k.startswith("node_")})
+    node_displacements = []
+    for nid in node_ids:
+        nd = {"node_id": nid}
+        for key in ("ux", "uy", "uz", "theta_x", "theta_y", "theta_z"):
+            nd[key] = formulas.get(f"node_{nid}_{key}", "0")
+        node_displacements.append(nd)
+
+    elem_ids = sorted({int(k.split("_")[1]) for k in formulas if k.startswith("elem_")})
+    element_forces = []
+    for eid in elem_ids:
+        eqs = {}
+        for sym_key, out_key in [("N(x)","N"), ("V2(x)","V2"), ("V3(x)","V3"),
+                                   ("M3(x)","M3"), ("M2(x)","M2")]:
+            formula = formulas.get(f"elem_{eid}_{out_key}", "0")
+            eqs[sym_key] = formula
+        element_forces.append({"element_id": eid, "nodes": "", "equations": eqs,
+                                "i_end (N, V2, V3, T, M2, M3)": "",
+                                "j_end (N, V2, V3, T, M2, M3)": ""})
+
+    react_ids = sorted({int(k.split("_")[1]) for k in formulas if k.startswith("react_")})
+    support_reactions = []
+    for nid in react_ids:
+        sr = {"node_id": nid}
+        for key in ("Rx", "Ry", "Rz", "Mx", "My", "Mz"):
+            sr[key] = formulas.get(f"react_{nid}_{key}", "0")
+        support_reactions.append(sr)
+
+    elem_Ls = [float(L) for L in current_fp["elem_lengths"]]  # 從當前幾何取長度
+
+    return {
+        "raw_result": {
+            "node_displacements": node_displacements,
+            "element_forces":     element_forces,
+            "support_reactions":  support_reactions,
+        },
+        "elem_Ls":     elem_Ls,
+        "fingerprint": current_fp,
+        "timestamp":   fp_lines.get("generated", datetime.now().strftime("%Y-%m-%dT%H:%M")),
+    }
