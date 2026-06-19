@@ -213,6 +213,66 @@ def _build_basis_row(elem_Ls, E_s, A_s, I_s, G_s, mode):
             row.append(Lk**3 / (E_s_ * I_s_))   # 均佈載重次項
     return np.array(row, dtype=np.float64)
 
+
+def _fit_and_symbolize(samples_P, samples_w, basis_P, basis_w,
+                       elem_Ls, dof_idx, sym_vars):
+    """對單一 DOF 擬合基底係數並組裝 SymPy 表達式。"""
+    E_sym  = sym_vars['E']
+    A_sym  = sym_vars['A']
+    I_sym  = sym_vars['I']
+    G_sym  = sym_vars['G']
+    P_sym  = sym_vars['P']
+    w_sym  = sym_vars['w']
+    L_syms = sym_vars['L_syms']
+
+    # 符號基底對應表（與 _build_basis_row 的順序嚴格對齊）
+    sym_bases_P = []
+    sym_bases_w = []
+    for Lk_sym in L_syms:
+        sym_bases_P.append(Lk_sym**3 / (E_sym * I_sym))
+        sym_bases_P.append(Lk_sym**2 / (E_sym * I_sym))
+        sym_bases_P.append(Lk_sym    / (E_sym * A_sym))
+        sym_bases_P.append(Lk_sym    / (2 * G_sym * I_sym))
+        sym_bases_P.append(Lk_sym**3 / (E_sym * I_sym))  # EI22 合併
+    for Lk_sym in L_syms:
+        sym_bases_w.append(Lk_sym**4 / (E_sym * I_sym))
+        sym_bases_w.append(Lk_sym**3 / (E_sym * I_sym))
+
+    def _fit(B, b_col):
+        """lstsq 擬合，回傳係數與相對殘差。"""
+        b = b_col
+        if np.all(np.abs(b) < 1e-40):
+            return np.zeros(B.shape[1]), 0.0
+        c, residuals, rank, _ = np.linalg.lstsq(B, b, rcond=None)
+        pred = B @ c
+        rel_err = np.max(np.abs(pred - b)) / (np.max(np.abs(b)) + 1e-40)
+        return c, rel_err
+
+    c_P, err_P = _fit(basis_P, samples_P[:, dof_idx])
+    c_w, err_w = _fit(basis_w, samples_w[:, dof_idx])
+
+    is_valid = (err_P < 1e-3) and (err_w < 1e-3)
+
+    # 稀疏篩選
+    tol_P = 1e-6 * (np.max(np.abs(c_P)) if np.any(c_P) else 1.0)
+    tol_w = 1e-6 * (np.max(np.abs(c_w)) if np.any(c_w) else 1.0)
+    c_P[np.abs(c_P) < tol_P] = 0.0
+    c_w[np.abs(c_w) < tol_w] = 0.0
+
+    # 組裝符號表達式
+    expr = sp.S.Zero
+    for j, coeff in enumerate(c_P):
+        if abs(coeff) > 1e-40:
+            c_rat = sp.nsimplify(float(coeff), tolerance=1e-6, rational=True)
+            expr += c_rat * sym_bases_P[j] * P_sym
+    for j, coeff in enumerate(c_w):
+        if abs(coeff) > 1e-40:
+            c_rat = sp.nsimplify(float(coeff), tolerance=1e-6, rational=True)
+            expr += c_rat * sym_bases_w[j] * w_sym
+
+    expr = sp.simplify(expr)
+    return expr, is_valid
+
 # ==============================================================================
 # 主分析函式
 # ==============================================================================
