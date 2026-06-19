@@ -212,6 +212,7 @@ with right_panel:
                 st.success("指紋一致，快取已載入，可使用快速代入。")
 
     output_area = st.empty()
+    res_eval = None
 
     if fast_btn:
         real_params = {"E": pe_E, "A": pe_A, "I": pe_I, "G": pe_G, "P": pe_P, "w": pe_w}
@@ -253,7 +254,11 @@ with right_panel:
                 elem_raw = next(e for e in truss_data['elements'] if e['id'] == elem_id)
                 node_i = next(n for n in truss_data['nodes'] if n['id'] == elem_raw['i'])
                 node_j = next(n for n in truss_data['nodes'] if n['id'] == elem_raw['j'])
-                actual_L = np.sqrt((node_j['x']-node_i['x'])**2 + (node_j['y']-node_i['y'])**2)
+                actual_L = np.sqrt(
+                    (node_j['x']-node_i['x'])**2 +
+                    (node_j['y']-node_i['y'])**2 +
+                    (float(node_j.get('z', 0)) - float(node_i.get('z', 0)))**2
+                )
 
                 x_vals = np.linspace(0, actual_L, 100)
                 fig = make_subplots(rows=1, cols=3, subplot_titles=("軸力圖 (ND)", "剪力圖 (V2)", "彎矩圖 (M3)"))
@@ -262,8 +267,7 @@ with right_panel:
                     expr_str = force[key]['formula']
                     try:
                         expr = sp.parse_expr(expr_str.replace('^', '**'))
-                        expr_num = expr.subs({x_sym: x_sym})  # formula is already fully substituted
-                        f_np = sp.lambdify(x_sym, expr_num, modules=['numpy', {'Heaviside': lambda x: np.where(x >= 0, 1, 0)}])
+                        f_np = sp.lambdify(x_sym, expr, modules=['numpy', {'Heaviside': lambda x: np.where(x >= 0, 1, 0)}])
                         y_vals = f_np(x_vals)
                         if isinstance(y_vals, (int, float, np.float64)):
                             y_vals = np.full_like(x_vals, float(y_vals))
