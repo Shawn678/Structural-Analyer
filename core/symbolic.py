@@ -163,12 +163,14 @@ def _assemble_K_np(truss_data, E_s, A_s, I_s, G_s):
     is_flat_y = all(abs(c[1]) < 1e-7 for c in nodes_coords)
     is_flat_z = all(abs(c[2]) < 1e-7 for c in nodes_coords)
     fixed_dofs: set = set()
-    if is_flat_y:
-        for idx in range(n_nodes):
-            fixed_dofs.update({NDOF*idx+1, NDOF*idx+3, NDOF*idx+5})
-    elif is_flat_z:
+    if is_flat_z:
+        # 結構在 XY 平面（z=0），固定面外自由度 uz, rx, ry
         for idx in range(n_nodes):
             fixed_dofs.update({NDOF*idx+2, NDOF*idx+3, NDOF*idx+4})
+    elif is_flat_y:
+        # 結構在 XZ 平面（y=0），固定面外自由度 uy, rx, rz
+        for idx in range(n_nodes):
+            fixed_dofs.update({NDOF*idx+1, NDOF*idx+3, NDOF*idx+5})
 
     for sup in truss_data['supports']:
         if sup.get('node_id') not in node_id_to_idx:
