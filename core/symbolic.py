@@ -49,6 +49,146 @@ def build_local_stiffness_3d_np(eal, gj,
     k[4,4]=k[10,10]=ei22_4; k[4,10]=k[10,4]=ei22_2
     return k
 
+def _assemble_K_np(truss_data, E_s, A_s, I_s, G_s):
+    """用指定材料參數組裝全域剛度矩陣，回傳 (K_np, elements_info, nodes_coords, free_dofs)。"""
+    node_list      = truss_data['nodes']
+    n_nodes        = len(node_list)
+    node_id_to_idx = {n['id']: i for i, n in enumerate(node_list)}
+    nodes_coords   = [
+        (_to_float(n.get('x', 0)),
+         _to_float(n.get('y', 0)),
+         _to_float(n.get('z', 0)))
+        for n in node_list
+    ]
+    NDOF      = 6
+    total_dof = NDOF * n_nodes
+    K_np      = np.zeros((total_dof, total_dof))
+    elements_info = []
+
+    for elem in truss_data['elements']:
+        ni = node_id_to_idx[elem['i']]
+        nj = node_id_to_idx[elem['j']]
+        xi, yi, zi = nodes_coords[ni]
+        xj, yj, zj = nodes_coords[nj]
+        dx, dy, dz = xj - xi, yj - yi, zj - zi
+        Le = np.sqrt(dx**2 + dy**2 + dz**2)
+        if Le < 1e-15:
+            continue
+
+        v1 = np.array([dx/Le, dy/Le, dz/Le])
+        is_vertical = (dx**2 + dy**2) < 1e-12
+        if not is_vertical:
+            v3_dir = np.cross(v1, np.array([0., 0., 1.]))
+            v3     = v3_dir / np.linalg.norm(v3_dir)
+            v2     = np.cross(v3, v1)
+        else:
+            v2 = np.array([1., 0., 0.])
+            v3 = np.cross(v1, v2)
+            v3 = v3 / np.linalg.norm(v3)
+
+        beta_val = _to_float(elem.get("beta", 0))
+        if abs(beta_val) > 1e-10:
+            br = beta_val * np.pi / 180
+            v2, v3 = (np.cos(br)*v2 + np.sin(br)*v3,
+                      -np.sin(br)*v2 + np.cos(br)*v3)
+
+        R_np = np.vstack([v1, v2, v3])
+        T_np = np.zeros((12, 12))
+        for b in range(4):
+            T_np[b*3:b*3+3, b*3:b*3+3] = R_np
+
+        pin_i       = elem.get("pin_i", False) or elem.get("hinge_i", False)
+        pin_j       = elem.get("pin_j", False) or elem.get("hinge_j", False)
+        both_hinged = pin_i and pin_j
+
+        J_s   = 2.0 * I_s
+        I22_s = I_s
+
+        eal = E_s * A_s / Le
+        gj  = G_s * J_s / Le
+
+        if both_hinged or I_s == 0:
+            ei33_12=ei33_6=ei33_4=ei33_2 = 0.0
+        else:
+            ei33_12 = 12*E_s*I_s / Le**3
+            ei33_6  =  6*E_s*I_s / Le**2
+            ei33_4  =  4*E_s*I_s / Le
+            ei33_2  =  2*E_s*I_s / Le
+
+        if both_hinged or I22_s == 0 or I_s == 0:
+            ei22_12=ei22_6=ei22_4=ei22_2 = 0.0
+        else:
+            ei22_12 = 12*E_s*I22_s / Le**3
+            ei22_6  =  6*E_s*I22_s / Le**2
+            ei22_4  =  4*E_s*I22_s / Le
+            ei22_2  =  2*E_s*I22_s / Le
+
+        kl_np = build_local_stiffness_3d_np(
+            eal, gj,
+            ei33_12, ei33_6, ei33_4, ei33_2,
+            ei22_12, ei22_6, ei22_4, ei22_2
+        )
+        k_global_np = T_np.T @ kl_np @ T_np
+        dofs = _elem_dofs(ni, nj, NDOF)
+        for ii, d1 in enumerate(dofs):
+            for jj, d2 in enumerate(dofs):
+                K_np[d1, d2] += k_global_np[ii, jj]
+
+        elements_info.append({
+            "id":       elem["id"],
+            "nodes":    (ni, nj),
+            "Le":       Le,
+            "kl_np":    kl_np,
+            "T_np":     T_np,
+            "is_truss": both_hinged,
+            "f_fixed_local_sum": sp.zeros(12, 1),
+            "applied_loads":     [],
+        })
+
+    # 彈簧支承
+    for sup in truss_data['supports']:
+        if sup.get('node_id') not in node_id_to_idx:
+            continue
+        idx = node_id_to_idx[sup['node_id']]
+        for key, dof_off in [('kx', 0), ('ky', 1), ('kt', 5)]:
+            val = sup.get(key, 0)
+            try:
+                fval = float(val)
+                if abs(fval) > 1e-15:
+                    K_np[NDOF*idx + dof_off, NDOF*idx + dof_off] += fval
+            except Exception:
+                pass
+
+    # 邊界條件
+    is_flat_y = all(abs(c[1]) < 1e-7 for c in nodes_coords)
+    is_flat_z = all(abs(c[2]) < 1e-7 for c in nodes_coords)
+    fixed_dofs: set = set()
+    if is_flat_y:
+        for idx in range(n_nodes):
+            fixed_dofs.update({NDOF*idx+1, NDOF*idx+3, NDOF*idx+5})
+    elif is_flat_z:
+        for idx in range(n_nodes):
+            fixed_dofs.update({NDOF*idx+2, NDOF*idx+3, NDOF*idx+4})
+
+    for sup in truss_data['supports']:
+        if sup.get('node_id') not in node_id_to_idx:
+            continue
+        idx = node_id_to_idx[sup['node_id']]
+        if sup.get('ux',    False): fixed_dofs.add(NDOF*idx+0)
+        if sup.get('uy',    False): fixed_dofs.add(NDOF*idx+1)
+        if sup.get('uz',    False): fixed_dofs.add(NDOF*idx+2)
+        if sup.get('rx',    False): fixed_dofs.add(NDOF*idx+3)
+        if sup.get('ry',    False): fixed_dofs.add(NDOF*idx+4)
+        if sup.get('theta', False): fixed_dofs.add(NDOF*idx+5)
+        if sup.get('rz',    False): fixed_dofs.add(NDOF*idx+5)
+
+    for i in range(total_dof):
+        if abs(K_np[i, i]) < 1e-20:
+            fixed_dofs.add(i)
+
+    free_dofs = [d for d in range(total_dof) if d not in fixed_dofs]
+    return K_np, elements_info, nodes_coords, free_dofs
+
 # ==============================================================================
 # 主分析函式
 # ==============================================================================
