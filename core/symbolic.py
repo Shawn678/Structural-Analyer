@@ -403,6 +403,7 @@ def run_symbolic_analysis(truss_data):
         G_s = G_base * scale
 
         K_s, _, _, free_s = _assemble_K_np(truss_data, E_s, A_s, I_s, G_s)
+        assert set(free_s) == set(free_dofs), f"採樣 {s_idx}: free_dof 集合在縮放下改變，請檢查結構輸入"
         K_red = K_s[np.ix_(free_s, free_s)]
 
         F_P_s = np.array([float(F_P_sym[d, 0].subs(P_sym, 1)) for d in free_s])
@@ -479,7 +480,7 @@ def run_symbolic_analysis(truss_data):
         f_fix  = info['f_fixed_local_sum']
 
         # 內力符號表達式：用位移 DOF 的符號表達式組裝
-        L_k    = L_syms[k_idx]
+        # 內力係數僅保留數值×P/w，不展開 L/E/I 符號（精確展開耗時過長）
         def _fi_sym(k):
             fix_k  = f_fix[k, 0]
             fix_P  = float(fix_k.subs(P_sym, 1).subs(w_sym, 0)) if fix_k != sp.S.Zero else 0.0
