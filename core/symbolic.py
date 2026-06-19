@@ -232,7 +232,7 @@ def _fit_and_symbolize(samples_P, samples_w, basis_P, basis_w,
         sym_bases_P.append(Lk_sym**3 / (E_sym * I_sym))
         sym_bases_P.append(Lk_sym**2 / (E_sym * I_sym))
         sym_bases_P.append(Lk_sym    / (E_sym * A_sym))
-        sym_bases_P.append(Lk_sym    / (2 * G_sym * I_sym))
+        sym_bases_P.append(Lk_sym    / (2 * G_sym * I_sym))  # J = 2I 假設，與 _build_basis_row 數值側一致
         sym_bases_P.append(Lk_sym**3 / (E_sym * I_sym))  # EI22 合併
     for Lk_sym in L_syms:
         sym_bases_w.append(Lk_sym**4 / (E_sym * I_sym))
@@ -240,12 +240,12 @@ def _fit_and_symbolize(samples_P, samples_w, basis_P, basis_w,
 
     def _fit(B, b_col):
         """lstsq 擬合，回傳係數與相對殘差。"""
-        b = b_col
-        if np.all(np.abs(b) < 1e-40):
+        if np.all(np.abs(b_col) < 1e-40):
             return np.zeros(B.shape[1]), 0.0
-        c, residuals, rank, _ = np.linalg.lstsq(B, b, rcond=None)
+        c, _, rank, _ = np.linalg.lstsq(B, b_col, rcond=None)
+        c = c.copy()
         pred = B @ c
-        rel_err = np.max(np.abs(pred - b)) / (np.max(np.abs(b)) + 1e-40)
+        rel_err = np.max(np.abs(pred - b_col)) / (np.max(np.abs(b_col)) + 1e-40)
         return c, rel_err
 
     c_P, err_P = _fit(basis_P, samples_P[:, dof_idx])
