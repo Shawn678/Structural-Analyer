@@ -189,6 +189,28 @@ def _assemble_K_np(truss_data, E_s, A_s, I_s, G_s):
     free_dofs = [d for d in range(total_dof) if d not in fixed_dofs]
     return K_np, elements_info, nodes_coords, free_dofs
 
+def _build_basis_row(elem_Ls, E_s, A_s, I_s, G_s, mode):
+    """建立單組採樣的基底列向量。"""
+    J_s   = 2.0 * I_s
+    G_s   = max(G_s, 1e-30)
+    J_s   = max(J_s, 1e-30)
+    I_s_  = max(I_s, 1e-30)
+    A_s_  = max(A_s, 1e-30)
+    E_s_  = max(E_s, 1e-30)
+
+    row = []
+    for Lk in elem_Ls:
+        if mode == 'P':
+            row.append(Lk**3 / (E_s_ * I_s_))   # EI33 彎曲主項
+            row.append(Lk**2 / (E_s_ * I_s_))   # EI33 彎曲次項
+            row.append(Lk    / (E_s_ * A_s_))   # EA 軸向
+            row.append(Lk    / (G_s  * J_s))    # GJ 扭轉
+            row.append(Lk**3 / (E_s_ * I_s_))   # EI22 面外（I22=I，合併入 EI33）
+        else:  # 'w'
+            row.append(Lk**4 / (E_s_ * I_s_))   # 均佈載重主項
+            row.append(Lk**3 / (E_s_ * I_s_))   # 均佈載重次項
+    return np.array(row, dtype=np.float64)
+
 # ==============================================================================
 # 主分析函式
 # ==============================================================================
