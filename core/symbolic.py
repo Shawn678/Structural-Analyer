@@ -101,27 +101,32 @@ def _assemble_K_np(truss_data, E_s, A_s, I_s, G_s):
         pin_j       = elem.get("pin_j", False) or elem.get("hinge_j", False)
         both_hinged = pin_i and pin_j
 
-        J_s   = 2.0 * I_s
-        I22_s = I_s
+        # Per-element properties, fall back to sampling scalar when not specified
+        elem_E  = _to_float(elem.get('E',   E_s),  E_s)
+        elem_A  = _to_float(elem.get('A',   A_s),  A_s)
+        elem_I  = _to_float(elem.get('I33', elem.get('I', I_s)), I_s)
+        elem_I22= _to_float(elem.get('I22', elem_I), elem_I)
+        elem_J  = _to_float(elem.get('J',   2.0 * elem_I), 2.0 * elem_I)
+        elem_G  = _to_float(elem.get('G',   G_s),  G_s)
 
-        eal = E_s * A_s / Le
-        gj  = G_s * J_s / Le
+        eal = elem_E * elem_A / Le
+        gj  = elem_G * elem_J / Le
 
-        if both_hinged or I_s == 0:
+        if both_hinged or elem_I == 0:
             ei33_12=ei33_6=ei33_4=ei33_2 = 0.0
         else:
-            ei33_12 = 12*E_s*I_s / Le**3
-            ei33_6  =  6*E_s*I_s / Le**2
-            ei33_4  =  4*E_s*I_s / Le
-            ei33_2  =  2*E_s*I_s / Le
+            ei33_12 = 12*elem_E*elem_I / Le**3
+            ei33_6  =  6*elem_E*elem_I / Le**2
+            ei33_4  =  4*elem_E*elem_I / Le
+            ei33_2  =  2*elem_E*elem_I / Le
 
-        if both_hinged or I22_s == 0 or I_s == 0:
+        if both_hinged or elem_I22 == 0 or elem_I == 0:
             ei22_12=ei22_6=ei22_4=ei22_2 = 0.0
         else:
-            ei22_12 = 12*E_s*I22_s / Le**3
-            ei22_6  =  6*E_s*I22_s / Le**2
-            ei22_4  =  4*E_s*I22_s / Le
-            ei22_2  =  2*E_s*I22_s / Le
+            ei22_12 = 12*elem_E*elem_I22 / Le**3
+            ei22_6  =  6*elem_E*elem_I22 / Le**2
+            ei22_4  =  4*elem_E*elem_I22 / Le
+            ei22_2  =  2*elem_E*elem_I22 / Le
 
         kl_np = build_local_stiffness_3d_np(
             eal, gj,
