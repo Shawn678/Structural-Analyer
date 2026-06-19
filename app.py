@@ -158,7 +158,11 @@ with left_panel:
             pe_A = st.number_input("A (m²)", value=0.01,  format="%.4f", key="pe_A")
             pe_G = st.number_input("G (Pa)", value=77e9,  format="%.3e", key="pe_G")
             pe_w = st.number_input("w 倍率", value=0.0,   key="pe_w")
-        st.caption("假設所有桿件使用相同截面參數。若各桿件截面不同，請執行完整分析。")
+        st.caption(
+            "**注意：** 目前代數解中，位移與內力公式的係數為純數值比例（已含 E/A/I/G 的數值計算）。"
+            "快速代入**僅縮放 P（集中載重）與 w（均佈載重）的倍率**，修改 E/A/I/G 不會改變結果。"
+            "若需更換截面材料，請重新執行完整分析（符號解）。"
+        )
         fast_btn = st.button(
             "⚡ 代入參數（快速）",
             disabled=not cache_valid,

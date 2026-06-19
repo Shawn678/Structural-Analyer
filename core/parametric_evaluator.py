@@ -45,11 +45,11 @@ def build_geometry_fingerprint(truss_data: dict) -> dict:
 
 
 def _subs_value(formula_str: str, subs_dict: dict) -> float | None:
-    """將公式字串代入數值，回傳 float；失敗回傳 None。"""
+    """將公式字串代入數值，回傳 float；失敗或結果非有限數時回傳 None。"""
     try:
         expr = sp.sympify(formula_str)
         result = float(expr.subs(subs_dict))
-        return result
+        return result if np.isfinite(result) else None
     except Exception:
         return None
 
@@ -166,6 +166,7 @@ def export_cache_to_txt(symbolic_cache: dict) -> str:
         f"elem_lengths={','.join(fp.get('elem_lengths', [f'{L:.6f}' for L in elem_Ls]))}",
         f"connections={','.join(fp.get('connections', []))}",
         f"supports={'|'.join(fp.get('supports', []))}",
+        f"timestamp={timestamp}",
         "[FORMULAS]",
     ]
 
@@ -290,5 +291,5 @@ def import_cache_from_txt(txt_content: str, truss_data: dict) -> dict:
         },
         "elem_Ls":     elem_Ls,
         "fingerprint": current_fp,
-        "timestamp":   fp_lines.get("generated", datetime.now().strftime("%Y-%m-%dT%H:%M")),
+        "timestamp":   fp_lines.get("timestamp", datetime.now().strftime("%Y-%m-%dT%H:%M")),
     }
