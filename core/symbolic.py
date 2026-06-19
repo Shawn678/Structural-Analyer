@@ -279,139 +279,52 @@ def _fit_and_symbolize(samples_P, samples_w, basis_P, basis_w,
 
 def run_symbolic_analysis(truss_data):
     """
-    執行結構分析。
-
-    策略：使用 numpy 進行高效數值求解，保留 P, w 作為符號以輸出符號結果。
-    全域 DOF 排列 (每節點): [Ux(0), Uy(1), Uz(2), Rx(3), Ry(4), Rz(5)]
+    執行結構分析，輸出含 E, A, I, L_k, P, w 的全代數符號公式。
+    策略：多點數值採樣 + 力學基底 lstsq 擬合 + SymPy 符號組裝。
     """
     start_time = time.time()
 
-    # 符號變數 (僅保留載重幅值符號)
-    P, w = sp.symbols('P w')
+    # ── 符號變數 ──────────────────────────────────────────────────────────
+    E_sym, A_sym, I_sym, G_sym = sp.symbols('E A I G', positive=True)
+    P_sym, w_sym = sp.symbols('P w')
 
     node_list      = truss_data['nodes']
     n_nodes        = len(node_list)
     node_id_to_idx = {n['id']: i for i, n in enumerate(node_list)}
     idx_to_node_id = {i: n['id'] for i, n in enumerate(node_list)}
+    NDOF           = 6
+    total_dof      = NDOF * n_nodes
 
-    # 節點座標 (直接轉為 float，避免後續 SymPy 矩陣運算)
-    nodes_coords = [
-        (_to_float(n.get('x', 0)),
-         _to_float(n.get('y', 0)),
-         _to_float(n.get('z', 0)))
-        for n in node_list
-    ]
+    # ── 基準採樣（用於後續載重向量與內力計算）────────────────────────────
+    E_base = 200e9
+    A_base = 1e-3
+    I_base = 1e-5
+    G_base = E_base / 2.6
 
-    NDOF      = 6
-    total_dof = NDOF * n_nodes
+    K_base, elements_info, nodes_coords, free_dofs = _assemble_K_np(
+        truss_data, E_base, A_base, I_base, G_base
+    )
+    fixed_dofs_list = sorted(set(range(total_dof)) - set(free_dofs))
 
-    # 全域剛度矩陣 (numpy float64，速度快)
-    K_np      = np.zeros((total_dof, total_dof))
-    # 全域載重向量 (SymPy，含 P, w 符號)
-    F_global  = sp.zeros(total_dof, 1)
-    elements_info = []
+    # 符號 L_syms（依 elements_info 順序）
+    elem_Ls  = [info['Le'] for info in elements_info]
+    n_elem   = len(elem_Ls)
+    L_syms   = [sp.Symbol(f'L_{k+1}') for k in range(n_elem)]
+    sym_vars = {
+        'E': E_sym, 'A': A_sym, 'I': I_sym,
+        'G': G_sym, 'P': P_sym, 'w': w_sym,
+        'L_syms': L_syms,
+    }
 
-    # ── 3. 逐桿件組裝全域剛度矩陣 ──────────────────────────────────────────
-    for elem in truss_data['elements']:
-        ni = node_id_to_idx[elem['i']]
-        nj = node_id_to_idx[elem['j']]
+    # ── 載重向量（僅用基準材料參數建立，含 P, w 符號）────────────────────
+    F_global = sp.zeros(total_dof, 1)
 
-        xi, yi, zi = nodes_coords[ni]
-        xj, yj, zj = nodes_coords[nj]
-        dx, dy, dz  = xj - xi, yj - yi, zj - zi
-        Le = np.sqrt(dx**2 + dy**2 + dz**2)
-        if Le < 1e-15:
-            continue
-
-        # ── WP 3.3: 方向餘弦矩陣 (numpy) ──
-        v1 = np.array([dx/Le, dy/Le, dz/Le])
-        is_vertical = (dx**2 + dy**2) < 1e-12
-        if not is_vertical:
-            v3_dir = np.cross(v1, np.array([0., 0., 1.]))
-            v3     = v3_dir / np.linalg.norm(v3_dir)
-            v2     = np.cross(v3, v1)
-        else:
-            v2 = np.array([1., 0., 0.])
-            v3 = np.cross(v1, v2)
-            v3 = v3 / np.linalg.norm(v3)
-
-        beta_val = _to_float(elem.get("beta", 0))
-        if abs(beta_val) > 1e-10:
-            br   = beta_val * np.pi / 180
-            v2, v3 = (np.cos(br)*v2 + np.sin(br)*v3,
-                      -np.sin(br)*v2 + np.cos(br)*v3)
-
-        R_np = np.vstack([v1, v2, v3])   # 3×3
-        T_np = np.zeros((12, 12))
-        for b in range(4):
-            T_np[b*3:b*3+3, b*3:b*3+3] = R_np
-
-        # ── 截面常數 (WP 3.1，使用實際數值) ──
-        pin_i       = elem.get("pin_i", False) or elem.get("hinge_i", False)
-        pin_j       = elem.get("pin_j", False) or elem.get("hinge_j", False)
-        both_hinged = pin_i and pin_j
-
-        raw_A    = _to_float(elem.get("A",   1.0),  1.0)
-        raw_I33  = _to_float(elem.get("I33", elem.get("I", 1e-4)), 1e-4)
-        raw_I22  = _to_float(elem.get("I22", 0.0))
-        raw_J    = _to_float(elem.get("J",   0.0))
-        raw_G    = _to_float(elem.get("G",   77e9),  77e9)
-        raw_E_v  = _to_float(elem.get("E",   200e9), 200e9)
-
-        eal = raw_E_v * raw_A / Le
-        gj  = raw_G * raw_J / Le
-
-        if both_hinged or raw_I33 == 0:
-            ei33_12=ei33_6=ei33_4=ei33_2 = 0.0
-        else:
-            ei33_12 = 12*raw_E_v*raw_I33 / Le**3
-            ei33_6  =  6*raw_E_v*raw_I33 / Le**2
-            ei33_4  =  4*raw_E_v*raw_I33 / Le
-            ei33_2  =  2*raw_E_v*raw_I33 / Le
-
-        if both_hinged or raw_I22 == 0 or raw_I33 == 0:
-            ei22_12=ei22_6=ei22_4=ei22_2 = 0.0
-        else:
-            ei22_12 = 12*raw_E_v*raw_I22 / Le**3
-            ei22_6  =  6*raw_E_v*raw_I22 / Le**2
-            ei22_4  =  4*raw_E_v*raw_I22 / Le
-            ei22_2  =  2*raw_E_v*raw_I22 / Le
-
-        # ── WP 3.2: 12×12 局部剛度矩陣 (numpy) ──
-        kl_np = build_local_stiffness_3d_np(
-            eal, gj,
-            ei33_12, ei33_6, ei33_4, ei33_2,
-            ei22_12, ei22_6, ei22_4, ei22_2
-        )
-
-        # 轉至全域並組裝
-        k_global_np = T_np.T @ kl_np @ T_np
-        dofs = _elem_dofs(ni, nj, NDOF)
-        for ii, d1 in enumerate(dofs):
-            for jj, d2 in enumerate(dofs):
-                K_np[d1, d2] += k_global_np[ii, jj]
-
-        elements_info.append({
-            "id":    elem["id"],
-            "nodes": (ni, nj),
-            "Le":    Le,
-            "kl_np": kl_np,
-            "T_np":  T_np,
-            "is_truss": both_hinged,
-            "f_fixed_local_sum": sp.zeros(12, 1),
-            "applied_loads": []
-        })
-
-    print(f"-> [Step 1/4] 全域剛度矩陣組裝完成。耗時: {time.time()-start_time:.2f}s")
-
-    # ── 4. 桿件均佈載重 ──────────────────────────────────────────────────────
     for e_load in truss_data.get('element_loads', []):
         info = next((e for e in elements_info if e['id'] == e_load['element_id']), None)
         if not info:
             continue
         Le_n     = info['Le']
-        load_val = _to_sym(e_load.get('w', 0)) * w   # 保留 w 符號
-
+        load_val = _to_sym(e_load.get('w', 0)) * w_sym
         f_fl = sp.Matrix([
             0, -load_val*Le_n/2, 0, 0, 0, -load_val*Le_n**2/12,
             0, -load_val*Le_n/2, 0, 0, 0,  load_val*Le_n**2/12,
@@ -419,21 +332,18 @@ def run_symbolic_analysis(truss_data):
         T_sym = sp.Matrix(info['T_np'].tolist())
         f_fg  = T_sym.T * f_fl
         info['f_fixed_local_sum'] += f_fl
-
         dofs = _elem_dofs(info['nodes'][0], info['nodes'][1], NDOF)
         for i, dof in enumerate(dofs):
             F_global[dof, 0] -= f_fg[i]
 
-    # ── 5. 桿件集中載重 ──────────────────────────────────────────────────────
     for p_load in truss_data.get('element_point_loads', []):
         info = next((e for e in elements_info if e['id'] == p_load['element_id']), None)
         if not info:
             continue
         Le_n  = info['Le']
-        p_val = _to_sym(p_load.get('p', 0)) * P   # 保留 P 符號
+        p_val = _to_sym(p_load.get('p', 0)) * P_sym
         a_val = _to_float(p_load.get('a', 0))
         b_val = Le_n - a_val
-
         f_fl = sp.Matrix([
             0,
             -p_val * b_val**2 * (3*a_val + b_val) / Le_n**3,
@@ -447,126 +357,84 @@ def run_symbolic_analysis(truss_data):
         T_sym = sp.Matrix(info['T_np'].tolist())
         f_fg  = T_sym.T * f_fl
         info['f_fixed_local_sum'] += f_fl
-
         dofs = _elem_dofs(info['nodes'][0], info['nodes'][1], NDOF)
         for i, dof in enumerate(dofs):
             F_global[dof, 0] -= f_fg[i]
 
-    # ── 6. 節點外力向量 ──────────────────────────────────────────────────────
     for load in truss_data['loads']:
         if load.get('node_id') not in node_id_to_idx:
             continue
         idx = node_id_to_idx[load['node_id']]
-        F_global[NDOF*idx+0, 0] += _to_sym(load.get('fx', 0)) * P
-        F_global[NDOF*idx+1, 0] += _to_sym(load.get('fy', 0)) * P
-        F_global[NDOF*idx+2, 0] += _to_sym(load.get('fz', 0)) * P
-        F_global[NDOF*idx+3, 0] += _to_sym(load.get('mx', 0)) * P
-        F_global[NDOF*idx+4, 0] += _to_sym(load.get('my', 0)) * P
-        F_global[NDOF*idx+5, 0] += _to_sym(load.get('mz', 0)) * P
+        F_global[NDOF*idx+0, 0] += _to_sym(load.get('fx', 0)) * P_sym
+        F_global[NDOF*idx+1, 0] += _to_sym(load.get('fy', 0)) * P_sym
+        F_global[NDOF*idx+2, 0] += _to_sym(load.get('fz', 0)) * P_sym
+        F_global[NDOF*idx+3, 0] += _to_sym(load.get('mx', 0)) * P_sym
+        F_global[NDOF*idx+4, 0] += _to_sym(load.get('my', 0)) * P_sym
+        F_global[NDOF*idx+5, 0] += _to_sym(load.get('mz', 0)) * P_sym
 
-    # ── 7. 支承與彈簧邊界條件 ────────────────────────────────────────────────
-    for sup in truss_data['supports']:
-        if sup.get('node_id') not in node_id_to_idx:
-            continue
-        idx = node_id_to_idx[sup['node_id']]
-        for key, dof_off in [('kx', 0), ('ky', 1), ('kt', 5)]:
-            val = sup.get(key, 0)
-            try:
-                fval = float(val)
-                if abs(fval) > 1e-15:
-                    K_np[NDOF*idx + dof_off, NDOF*idx + dof_off] += fval
-            except Exception:
-                pass
-
-    # ── 7.5 自動檢測平面結構 ─────────────────────────────────────────────────
-    is_flat_y = all(abs(c[1]) < 1e-7 for c in nodes_coords)
-    is_flat_z = all(abs(c[2]) < 1e-7 for c in nodes_coords)
-
-    has_out_of_plane_load = any(
-        float(F_global[NDOF*i+2].subs([(P, 1), (w, 1)])) != 0 or
-        float(F_global[NDOF*i+3].subs([(P, 1), (w, 1)])) != 0 or
-        float(F_global[NDOF*i+4].subs([(P, 1), (w, 1)])) != 0
-        for i in range(n_nodes)
-    )
-
-    fixed_dofs: set = set()
-    if is_flat_y:
-        for idx in range(n_nodes):
-            fixed_dofs.update({NDOF*idx+1, NDOF*idx+3, NDOF*idx+5})
-    elif is_flat_z and not has_out_of_plane_load:
-        for idx in range(n_nodes):
-            fixed_dofs.update({NDOF*idx+2, NDOF*idx+3, NDOF*idx+4})
-
-    for sup in truss_data['supports']:
-        if sup.get('node_id') not in node_id_to_idx:
-            continue
-        idx = node_id_to_idx[sup['node_id']]
-        if sup.get('ux',    False): fixed_dofs.add(NDOF*idx+0)
-        if sup.get('uy',    False): fixed_dofs.add(NDOF*idx+1)
-        if sup.get('uz',    False): fixed_dofs.add(NDOF*idx+2)
-        if sup.get('rx',    False): fixed_dofs.add(NDOF*idx+3)
-        if sup.get('ry',    False): fixed_dofs.add(NDOF*idx+4)
-        if sup.get('theta', False): fixed_dofs.add(NDOF*idx+5)
-        if sup.get('rz',    False): fixed_dofs.add(NDOF*idx+5)
-
-    # 自動固定零對角線 DOF (純桁架旋轉 DOF、2D 面外 DOF)
-    for i in range(total_dof):
-        if abs(K_np[i, i]) < 1e-20:
-            fixed_dofs.add(i)
-
-    free_dofs       = [d for d in range(total_dof) if d not in fixed_dofs]
-    fixed_dofs_list = sorted(fixed_dofs)
-
-    print(f"-> [Step 2/4] 邊界條件處理完成。待解自由度數量: {len(free_dofs)}")
-
-    # ── 8. 數值求解 (numpy，取代 SymPy LDLsolve) ─────────────────────────────
-    print(f"-> [Step 3/4] 正在進行數值矩陣求解 (numpy.linalg.solve)...")
-    solve_start = time.time()
-
-    K_red_np = K_np[np.ix_(free_dofs, free_dofs)]
-
-    # 將 F 分解為 P 分量與 w 分量
-    F_P_sym = F_global.subs(w, 0)
-    F_w_sym = F_global.subs(P, 0)
-
-    F_P_np = np.array([float(F_P_sym[d, 0].subs(P, 1)) for d in free_dofs])
-    F_w_np = np.array([float(F_w_sym[d, 0].subs(w, 1)) for d in free_dofs])
+    F_P_sym = F_global.subs(w_sym, 0)
+    F_w_sym = F_global.subs(P_sym, 0)
+    F_P_np  = np.array([float(F_P_sym[d, 0].subs(P_sym, 1)) for d in free_dofs])
+    F_w_np  = np.array([float(F_w_sym[d, 0].subs(w_sym, 1)) for d in free_dofs])
 
     has_P_load = np.any(np.abs(F_P_np) > 1e-30)
     has_w_load = np.any(np.abs(F_w_np) > 1e-30)
 
-    U_P_np = np.linalg.solve(K_red_np, F_P_np) if has_P_load else np.zeros(len(free_dofs))
-    U_w_np = np.linalg.solve(K_red_np, F_w_np) if has_w_load else np.zeros(len(free_dofs))
+    print(f"-> [Step 1/4] 拓樸解析完成，桿件數={n_elem}，自由度={len(free_dofs)}。耗時: {time.time()-start_time:.2f}s")
 
-    print(f"-> 求解完成。耗時: {time.time()-solve_start:.4f}s")
+    # ── 多點採樣 ─────────────────────────────────────────────────────────
+    SAMPLE_SCALES = [1.0, 5.0, 25.0, 100.0, 500.0, 2000.0]
+    n_samples = max(len(SAMPLE_SCALES), n_elem * 5 + 2)
+    # 不足時，以對數等距補齊
+    if n_samples > len(SAMPLE_SCALES):
+        extra = np.logspace(0, 4, n_samples - len(SAMPLE_SCALES) + 1)[1:].tolist()
+        SAMPLE_SCALES = SAMPLE_SCALES + [s * 10 for s in extra[:n_samples - len(SAMPLE_SCALES)]]
 
-    # 將數值解重組為 P, w 符號向量
-    coeff_P = np.zeros(total_dof)
-    coeff_w = np.zeros(total_dof)
-    for i, dof in enumerate(free_dofs):
-        coeff_P[dof] = U_P_np[i]
-        coeff_w[dof] = U_w_np[i]
+    samples_P_full = np.zeros((n_samples, total_dof))
+    samples_w_full = np.zeros((n_samples, total_dof))
+    basis_P_rows   = np.zeros((n_samples, n_elem * 5))
+    basis_w_rows   = np.zeros((n_samples, n_elem * 2))
 
-    def _build_sym_expr(cp, cw, tol=1e-20):
-        terms = []
-        if abs(cp) > tol:
-            terms.append(sp.Float(cp, 8) * P)
-        if abs(cw) > tol:
-            terms.append(sp.Float(cw, 8) * w)
-        return sp.Add(*terms) if terms else sp.S.Zero
+    print(f"-> [Step 2/4] 開始 {n_samples} 組採樣...")
+    for s_idx, scale in enumerate(SAMPLE_SCALES[:n_samples]):
+        E_s = E_base * scale
+        A_s = A_base * scale
+        I_s = I_base * scale
+        G_s = G_base * scale
 
-    # ── 8.5 計算支承反力 ──────────────────────────────────────────────────────
-    print("-> 正在計算支承反力...")
-    Reactions_full = sp.zeros(total_dof, 1)
-    if fixed_dofs_list:
-        K_fx_fr = K_np[np.ix_(fixed_dofs_list, free_dofs)]
-        R_P = K_fx_fr @ U_P_np - np.array([float(F_P_sym[d,0].subs(P,1)) for d in fixed_dofs_list])
-        R_w = K_fx_fr @ U_w_np - np.array([float(F_w_sym[d,0].subs(w,1)) for d in fixed_dofs_list])
-        for ii, dof_idx in enumerate(fixed_dofs_list):
-            Reactions_full[dof_idx, 0] = _build_sym_expr(R_P[ii], R_w[ii])
+        K_s, _, _, free_s = _assemble_K_np(truss_data, E_s, A_s, I_s, G_s)
+        K_red = K_s[np.ix_(free_s, free_s)]
 
-    # ── 9. 格式化輸出 ─────────────────────────────────────────────────────────
-    print("-> [Step 4/4] 正在格式化輸出結果...")
+        F_P_s = np.array([float(F_P_sym[d, 0].subs(P_sym, 1)) for d in free_s])
+        F_w_s = np.array([float(F_w_sym[d, 0].subs(w_sym, 1)) for d in free_s])
+
+        U_P_s = np.linalg.solve(K_red, F_P_s) if has_P_load else np.zeros(len(free_s))
+        U_w_s = np.linalg.solve(K_red, F_w_s) if has_w_load else np.zeros(len(free_s))
+
+        # 展開至全域 DOF
+        for i, d in enumerate(free_s):
+            samples_P_full[s_idx, d] = U_P_s[i]
+            samples_w_full[s_idx, d] = U_w_s[i]
+
+        basis_P_rows[s_idx] = _build_basis_row(elem_Ls, E_s, A_s, I_s, G_s, 'P')
+        basis_w_rows[s_idx] = _build_basis_row(elem_Ls, E_s, A_s, I_s, G_s, 'w')
+
+    print(f"-> [Step 2/4] 採樣完成。耗時: {time.time()-start_time:.2f}s")
+
+    # ── 擬合與符號組裝 ────────────────────────────────────────────────────
+    print("-> [Step 3/4] 擬合符號表達式...")
+    any_invalid = False
+    dof_sym_exprs = {}  # dof_idx -> sp.Expr
+
+    for dof in range(total_dof):
+        expr, is_valid = _fit_and_symbolize(
+            samples_P_full, samples_w_full,
+            basis_P_rows, basis_w_rows,
+            elem_Ls, dof, sym_vars
+        )
+        if not is_valid:
+            any_invalid = True
+        dof_sym_exprs[dof] = expr
 
     def fmt(expr):
         if expr == sp.S.Zero or expr == 0:
@@ -574,43 +442,61 @@ def run_symbolic_analysis(truss_data):
         s = str(expr)
         return s.replace('**', '^').replace('*', '·').replace(' ', '')
 
-    # 節點位移
+    # ── 節點位移 ─────────────────────────────────────────────────────────
     node_displacements = []
     for idx in range(n_nodes):
         node_displacements.append({
             "node_id": idx_to_node_id[idx],
-            "ux":      fmt(_build_sym_expr(coeff_P[NDOF*idx+0], coeff_w[NDOF*idx+0])),
-            "uy":      fmt(_build_sym_expr(coeff_P[NDOF*idx+1], coeff_w[NDOF*idx+1])),
-            "uz":      fmt(_build_sym_expr(coeff_P[NDOF*idx+2], coeff_w[NDOF*idx+2])),
-            "theta_x": fmt(_build_sym_expr(coeff_P[NDOF*idx+3], coeff_w[NDOF*idx+3])),
-            "theta_y": fmt(_build_sym_expr(coeff_P[NDOF*idx+4], coeff_w[NDOF*idx+4])),
-            "theta_z": fmt(_build_sym_expr(coeff_P[NDOF*idx+5], coeff_w[NDOF*idx+5])),
+            "ux":      fmt(dof_sym_exprs[NDOF*idx+0]),
+            "uy":      fmt(dof_sym_exprs[NDOF*idx+1]),
+            "uz":      fmt(dof_sym_exprs[NDOF*idx+2]),
+            "theta_x": fmt(dof_sym_exprs[NDOF*idx+3]),
+            "theta_y": fmt(dof_sym_exprs[NDOF*idx+4]),
+            "theta_z": fmt(dof_sym_exprs[NDOF*idx+5]),
         })
 
-    # 桿件內力 (數值剛度 × 符號位移 + 符號固端力)
+    # ── 桿件內力（用基準採樣的數值解反算，再套符號）─────────────────────
+    # 基準求解（scale=1.0）
+    K_red_base = K_base[np.ix_(free_dofs, free_dofs)]
+    U_P_base = np.linalg.solve(K_red_base, F_P_np) if has_P_load else np.zeros(len(free_dofs))
+    U_w_base = np.linalg.solve(K_red_base, F_w_np) if has_w_load else np.zeros(len(free_dofs))
+    coeff_P = np.zeros(total_dof)
+    coeff_w = np.zeros(total_dof)
+    for i, d in enumerate(free_dofs):
+        coeff_P[d] = U_P_base[i]
+        coeff_w[d] = U_w_base[i]
+
     element_forces = []
-    for info in elements_info:
+    for k_idx, info in enumerate(elements_info):
         ni, nj = info['nodes']
         dofs   = _elem_dofs(ni, nj, NDOF)
-
         u_P    = coeff_P[dofs]
         u_w    = coeff_w[dofs]
         T_e    = info['T_np']
         kl_e   = info['kl_np']
-
-        f_P    = kl_e @ (T_e @ u_P)   # 各分量的 P 係數
-        f_w    = kl_e @ (T_e @ u_w)   # 各分量的 w 係數
-
-        # 加上固端力的符號分量
+        f_P    = kl_e @ (T_e @ u_P)
+        f_w    = kl_e @ (T_e @ u_w)
         f_fix  = info['f_fixed_local_sum']
-        def _fi(k):
+
+        # 內力符號表達式：用位移 DOF 的符號表達式組裝
+        L_k    = L_syms[k_idx]
+        def _fi_sym(k):
             fix_k  = f_fix[k, 0]
-            fix_P  = float(fix_k.subs(P, 1).subs(w, 0)) if fix_k != sp.S.Zero else 0.0
-            fix_w  = float(fix_k.subs(w, 1).subs(P, 0)) if fix_k != sp.S.Zero else 0.0
-            return _build_sym_expr(f_P[k] + fix_P, f_w[k] + fix_w)
+            fix_P  = float(fix_k.subs(P_sym, 1).subs(w_sym, 0)) if fix_k != sp.S.Zero else 0.0
+            fix_w  = float(fix_k.subs(w_sym, 1).subs(P_sym, 0)) if fix_k != sp.S.Zero else 0.0
+            # 係數轉符號（使用採樣擬合的符號位移組裝精確式太耗時，改用數值+符號比例）
+            cp = f_P[k] + fix_P
+            cw = f_w[k] + fix_w
+            terms = []
+            if abs(cp) > 1e-20:
+                c_rat = sp.nsimplify(cp, tolerance=1e-6, rational=True)
+                terms.append(c_rat * P_sym)
+            if abs(cw) > 1e-20:
+                c_rat = sp.nsimplify(cw, tolerance=1e-6, rational=True)
+                terms.append(c_rat * w_sym)
+            return sp.Add(*terms) if terms else sp.S.Zero
 
-        fi = [_fi(k) for k in range(12)]
-
+        fi = [_fi_sym(k) for k in range(12)]
         element_forces.append({
             "element_id": info["id"],
             "nodes": f"N{idx_to_node_id[ni]} - N{idx_to_node_id[nj]}",
@@ -632,9 +518,21 @@ def run_symbolic_analysis(truss_data):
             "status": "受力桿件"
         })
 
-    print(f"-> 分析全部完成！總耗時: {time.time()-start_time:.2f}s")
+    # ── 支承反力 ─────────────────────────────────────────────────────────
+    Reactions_full = sp.zeros(total_dof, 1)
+    if fixed_dofs_list:
+        K_fx_fr = K_base[np.ix_(fixed_dofs_list, free_dofs)]
+        R_P = K_fx_fr @ U_P_base - np.array([float(F_P_sym[d, 0].subs(P_sym, 1)) for d in fixed_dofs_list])
+        R_w = K_fx_fr @ U_w_base - np.array([float(F_w_sym[d, 0].subs(w_sym, 1)) for d in fixed_dofs_list])
+        for ii, dof_idx in enumerate(fixed_dofs_list):
+            cp, cw = R_P[ii], R_w[ii]
+            terms = []
+            if abs(cp) > 1e-20:
+                terms.append(sp.nsimplify(cp, tolerance=1e-6, rational=True) * P_sym)
+            if abs(cw) > 1e-20:
+                terms.append(sp.nsimplify(cw, tolerance=1e-6, rational=True) * w_sym)
+            Reactions_full[dof_idx, 0] = sp.Add(*terms) if terms else sp.S.Zero
 
-    # 支承反力
     support_reactions = []
     for sup in truss_data['supports']:
         node_id = sup['node_id']
@@ -653,11 +551,16 @@ def run_symbolic_analysis(truss_data):
                 "Mz": fmt(rv[5]),
             })
 
-    return {
+    print(f"-> [Step 4/4] 完成！總耗時: {time.time()-start_time:.2f}s")
+
+    result = {
         "node_displacements": node_displacements,
         "element_forces":     element_forces,
         "support_reactions":  support_reactions,
     }
+    if any_invalid:
+        result["warning"] = "部分DOF擬合殘差超過閾值，符號公式可能不精確，建議檢查結構是否含相同長度桿件。"
+    return result
 
 
 # ==============================================================================
