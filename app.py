@@ -23,32 +23,6 @@ def _compute_fingerprint(nodes_json: str, elements_json: str, supports_json: str
         "loads": [], "element_loads": [], "element_point_loads": [],
     })
 
-@st.cache_data(show_spinner=False)
-def _check_override(sections_json: str, materials_json: str, elem_records_json: str) -> list[str]:
-    """返回所有被覆蓋的 element id（字串形式）。"""
-    import json
-    secs = {s["name"]: s for s in json.loads(sections_json)}
-    mats = {m["name"]: m for m in json.loads(materials_json)}
-
-    def sec_val(sec_name, field):
-        if sec_name not in secs:
-            return None
-        s = secs[sec_name]
-        if field in ("E", "G"):
-            return mats.get(s.get("material", ""), {}).get(field)
-        return s.get(field)
-
-    overridden = []
-    for r in json.loads(elem_records_json):
-        sn = r.get("section", "")
-        if not sn or sn not in secs:
-            continue
-        for field in ("E", "G", "A", "I33", "I22", "J"):
-            ref = sec_val(sn, field)
-            if ref is not None and abs(float(r.get(field, ref)) - ref) > abs(ref) * 1e-9:
-                overridden.append(str(r.get("id", "")))
-                break
-    return overridden
 
 st.set_page_config(page_title="Structural Analysis", layout="wide")
 
@@ -281,7 +255,7 @@ with left_panel:
                 new_secs = []
                 for s in st.session_state["sections"]:
                     if s["name"] == target_sec:
-                        s = {**s, "shape": shape_sel, **props}
+                        s = {**s, "shape": shape_sel, **shape_vals, **props}
                     new_secs.append(s)
                 st.session_state["sections"] = new_secs
                 st.rerun()
@@ -307,27 +281,6 @@ with left_panel:
         "J=抗扭常數(m⁴)、beta=滾轉角(deg，預設0)。\n"
         "pin_i / pin_j: 桿件端點釋放。若兩端皆為鉸接，程式自動忽略慣性矩 (視為二力構件)。"
     )
-    elements_df = st.data_editor(
-        pd.DataFrame([
-            {"id":1,"i":1,"j":2,"section":"","E":200e9,"G":77e9,"A":0.01,
-             "I33":1e-4,"I22":1e-5,"J":1e-5,"beta":0.0,"dL":0.0,
-             "pin_i":False,"pin_j":False,"status":""},
-            {"id":2,"i":2,"j":3,"section":"","E":200e9,"G":77e9,"A":0.01,
-             "I33":1e-4,"I22":1e-5,"J":1e-5,"beta":0.0,"dL":0.0,
-             "pin_i":False,"pin_j":False,"status":""},
-            {"id":3,"i":4,"j":1,"section":"","E":200e9,"G":77e9,"A":0.01,
-             "I33":1e-4,"I22":1e-5,"J":1e-5,"beta":0.0,"dL":0.0,
-             "pin_i":False,"pin_j":False,"status":""},
-        ]),
-        column_config={
-            "section": st.column_config.SelectboxColumn(
-                "截面", options=[""] + sec_names, width="small"
-            ),
-            "status": st.column_config.TextColumn("狀態", disabled=True, width="small"),
-        },
-        num_rows="dynamic", key="elements",
-    )
-
     # section 帶入 + override 偵測
     import json as _json
     sec_map_ui = {s["name"]: s for s in st.session_state["sections"]}
@@ -342,46 +295,93 @@ with left_panel:
             return m.get(field)
         return s.get(field)
 
-    # Initialize tracking dict if needed
+    _default_elem_rows = [
+        {"id":1,"i":1,"j":2,"section":"","E":None,"G":None,"A":None,
+         "I33":None,"I22":None,"J":None,"beta":0.0,"dL":0.0,"pin_i":False,"pin_j":False,"status":""},
+        {"id":2,"i":2,"j":3,"section":"","E":None,"G":None,"A":None,
+         "I33":None,"I22":None,"J":None,"beta":0.0,"dL":0.0,"pin_i":False,"pin_j":False,"status":""},
+        {"id":3,"i":4,"j":1,"section":"","E":None,"G":None,"A":None,
+         "I33":None,"I22":None,"J":None,"beta":0.0,"dL":0.0,"pin_i":False,"pin_j":False,"status":""},
+    ]
+    if "elements_data" not in st.session_state:
+        st.session_state["elements_data"] = _default_elem_rows
     if "elem_prev_section" not in st.session_state:
         st.session_state["elem_prev_section"] = {}
 
+    elements_df = st.data_editor(
+        pd.DataFrame(st.session_state["elements_data"]),
+        column_config={
+            "section": st.column_config.SelectboxColumn(
+                "截面", options=[""] + sec_names, width="small"
+            ),
+            "status": st.column_config.TextColumn("狀態", disabled=True, width="small"),
+        },
+        num_rows="dynamic", key="elements",
+    )
+
+    # 斷面帶入：section 改變時自動填入對應參數
+    _need_rerun = False
     updated_rows = []
     for _, row in elements_df.iterrows():
         r = row.to_dict()
         elem_id = r.get("id", "")
-        sn = r.get("section", "")
+        sn = r.get("section") or ""
         prev_sn = st.session_state["elem_prev_section"].get(str(elem_id), None)
 
-        # Auto-fill when section changes (including first selection)
         if sn and sn in sec_map_ui and sn != prev_sn:
             for field in ("E", "G", "A", "I33", "I22", "J"):
                 ref = _sec_val(sn, field)
                 if ref is not None:
                     r[field] = ref
+            _need_rerun = True
 
-        # Update tracking
         st.session_state["elem_prev_section"][str(elem_id)] = sn
         updated_rows.append(r)
 
-    # 用快取函式批次判斷哪些 element 被覆蓋（輸入不變時不重算）
+    # override 偵測：數值與斷面預設值不同時標記
     _secs_json  = _json.dumps(st.session_state["sections"],  sort_keys=True)
     _mats_json  = _json.dumps(st.session_state["materials"], sort_keys=True)
     _elems_json = _json.dumps(updated_rows, sort_keys=True)
-    _overridden_ids = set(_check_override(_secs_json, _mats_json, _elems_json))
+
+    def _compute_overridden_ids(sections_json, materials_json, elem_records_json):
+        import json
+        secs = {s["name"]: s for s in json.loads(sections_json)}
+        mats = {m["name"]: m for m in json.loads(materials_json)}
+        def sec_val(sn, field):
+            if sn not in secs:
+                return None
+            s = secs[sn]
+            if field in ("E", "G"):
+                return mats.get(s.get("material", ""), {}).get(field)
+            return s.get(field)
+        result = set()
+        for r in json.loads(elem_records_json):
+            sn = r.get("section", "")
+            if not sn or sn not in secs:
+                continue
+            for field in ("E", "G", "A", "I33", "I22", "J"):
+                ref = sec_val(sn, field)
+                val = r.get(field)
+                if ref is not None and val is not None:
+                    try:
+                        if abs(float(val) - ref) > abs(ref) * 1e-9:
+                            result.add(str(r.get("id", "")))
+                            break
+                    except (TypeError, ValueError):
+                        pass
+        return result
+
+    _overridden_ids = _compute_overridden_ids(_secs_json, _mats_json, _elems_json)
     for r in updated_rows:
-        r["status"] = "【修改】" if str(r.get("id", "")) in _overridden_ids else ""
+        r["status"] = "● 已修改" if str(r.get("id", "")) in _overridden_ids else ""
 
-    elements_df_styled = pd.DataFrame(updated_rows)
+    st.session_state["elements_data"] = updated_rows
+    elements_df = pd.DataFrame(updated_rows)
 
-    def _highlight_override(row):
-        return ["background-color: #FFE0B2" if row.get("status") == "【修改】" else "" for _ in row]
-
-    st.dataframe(
-        elements_df_styled.style.apply(_highlight_override, axis=1),
-        use_container_width=True,
-    )
-    elements_df = elements_df_styled  # 後續分析使用帶入後的版本
+    if _need_rerun:
+        # 清除 data_editor 的快取 key，讓下次 rerun 從 elements_data 重新載入
+        st.session_state.pop("elements", None)
+        st.rerun()
 
     st.subheader("支承 (Supports)")
     st.caption(
@@ -436,6 +436,15 @@ with left_panel:
             _json.dumps(supports_df.dropna(subset=['node_id']).fillna(False).to_dict('records'), sort_keys=True),
         )
         cache_valid = (current_fp == st.session_state["sym_cache"].get("fingerprint"))
+
+    if cache_valid:
+        _current_sec_groups = sorted(set(
+            r.get("section", "") for r in st.session_state.get("elements_data", [])
+            if r.get("section")
+        ))
+        _cached_sec_groups = st.session_state["sym_cache"].get("section_groups", [])
+        if _current_sec_groups != _cached_sec_groups:
+            cache_valid = False
 
     st.caption("快速代入：幾何與支承不變時，直接代入新材料/載重參數，無需重新求符號解。")
     with st.expander("⚡ 快速代入參數", expanded=False):
@@ -582,6 +591,21 @@ with right_panel:
         try:
             # 清除舊快取，強制重新求解
             st.session_state["sym_cache"] = {}
+
+            # 建立各斷面組的符號對應
+            _sec_group_map = {}
+            for gi, sec in enumerate(st.session_state["sections"], start=1):
+                sn = sec.get("name", "")
+                if not sn:
+                    continue
+                _sec_group_map[sn] = {
+                    "E":   sp.Symbol(f"E_s{gi}"),
+                    "A":   sp.Symbol(f"A_s{gi}"),
+                    "I33": sp.Symbol(f"I_s{gi}"),
+                    "I22": sp.Symbol(f"I_s{gi}"),
+                    "G":   sp.Symbol(f"G_s{gi}"),
+                }
+
             real_params = {"E": pe_E, "A": pe_A, "I": pe_I, "G": pe_G, "P": pe_P, "w": pe_w}
             res_eval = evaluate_real_results(
                 truss_data, real_params,
@@ -589,6 +613,7 @@ with right_panel:
                 materials=st.session_state["materials"],
                 sections=st.session_state["sections"],
                 include_self_weight=include_sw,
+                section_group_map=_sec_group_map if _sec_group_map else None,
             )
             res = st.session_state["sym_cache"]["raw_result"]
             output_area.json(res_eval)
