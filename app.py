@@ -13,6 +13,43 @@ from core.parametric_evaluator import (
 )
 from core.materials import compute_section_props, expand_truss_data, compute_self_weight
 
+@st.cache_data(show_spinner=False)
+def _compute_fingerprint(nodes_json: str, elements_json: str, supports_json: str):
+    import json
+    return build_geometry_fingerprint({
+        "nodes": json.loads(nodes_json),
+        "elements": json.loads(elements_json),
+        "supports": json.loads(supports_json),
+        "loads": [], "element_loads": [], "element_point_loads": [],
+    })
+
+@st.cache_data(show_spinner=False)
+def _check_override(sections_json: str, materials_json: str, elem_records_json: str) -> list[str]:
+    """返回所有被覆蓋的 element id（字串形式）。"""
+    import json
+    secs = {s["name"]: s for s in json.loads(sections_json)}
+    mats = {m["name"]: m for m in json.loads(materials_json)}
+
+    def sec_val(sec_name, field):
+        if sec_name not in secs:
+            return None
+        s = secs[sec_name]
+        if field in ("E", "G"):
+            return mats.get(s.get("material", ""), {}).get(field)
+        return s.get(field)
+
+    overridden = []
+    for r in json.loads(elem_records_json):
+        sn = r.get("section", "")
+        if not sn or sn not in secs:
+            continue
+        for field in ("E", "G", "A", "I33", "I22", "J"):
+            ref = sec_val(sn, field)
+            if ref is not None and abs(float(r.get(field, ref)) - ref) > abs(ref) * 1e-9:
+                overridden.append(str(r.get("id", "")))
+                break
+    return overridden
+
 st.set_page_config(page_title="Structural Analysis", layout="wide")
 
 if "sym_cache" not in st.session_state:
@@ -100,7 +137,7 @@ with left_panel:
     mat_names = [m["name"] for m in st.session_state["materials"]]
 
     st.subheader("截面 (Sections)")
-    SHAPE_OPTIONS = ["Custom", "矩形實心", "圓形實心", "矩形管", "圓管", "I形"]
+    SHAPE_OPTIONS = ["Custom", "矩形實心", "圓形實心", "矩形管", "圓管", "I形", "箱涵"]
     SHAPE_INPUTS  = {
         "矩形實心": [("b","寬 b (m)"),("h","高 h (m)")],
         "圓形實心": [("d","直徑 d (m)")],
@@ -108,6 +145,16 @@ with left_panel:
         "圓管":     [("d","外徑 d (m)"),("t","壁厚 t (m)")],
         "I形":      [("H","全高 H (m)"),("bf","翼板寬 bf (m)"),
                      ("tf","翼板厚 tf (m)"),("tw","腹板厚 tw (m)")],
+        "箱涵": [
+            ("b_top", "頂板總寬 b_top (m)"),
+            ("b_bot", "底板總寬 b_bot (m)"),
+            ("h",     "箱涵全高 h (m)"),
+            ("t_top", "頂板厚 t_top (m)"),
+            ("t_bot", "底板厚 t_bot (m)"),
+            ("t_web", "外腹板厚 t_web (m)"),
+            ("t_dia", "內隔板厚 t_dia (m)"),
+            ("c_top", "頂板懸臂長 c_top (m)"),
+        ],
     }
 
     sec_df = st.data_editor(
@@ -131,14 +178,103 @@ with left_panel:
         st.caption(
             "⚠️ 矩形實心的 J 採用 Timoshenko 近似公式；"
             "矩形管的 J 採用薄壁閉口近似；"
-            "I 形截面的 J 採用薄壁開口近似。精確值請查結構手冊。"
+            "I 形截面的 J 採用薄壁開口近似；"
+            "箱涵的 J 採用 Bredt 多室薄壁公式。精確值請查結構手冊。"
         )
         target_sec = st.selectbox("填入截面", options=sec_names, key="shape_target_sec")
         shape_sel  = st.selectbox("截面形狀", options=list(SHAPE_INPUTS.keys()), key="shape_sel")
         shape_vals = {}
-        cols = st.columns(len(SHAPE_INPUTS[shape_sel]))
-        for col, (k, label) in zip(cols, SHAPE_INPUTS[shape_sel]):
-            shape_vals[k] = col.number_input(label, value=0.1, format="%.4f", key=f"sv_{k}")
+        if shape_sel == "箱涵":
+            # 箱涵：n_cell 用 selectbox，其餘參數兩欄排列
+            shape_vals["n_cell"] = st.selectbox(
+                "室數 n_cell", options=[1, 2, 3, 4, 5], key="sv_n_cell"
+            )
+            BOX_DEFAULTS = {
+                "b_top": 6.0, "b_bot": 5.0, "h": 2.0,
+                "t_top": 0.25, "t_bot": 0.25, "t_web": 0.3,
+                "t_dia": 0.2, "c_top": 0.5,
+            }
+            param_keys = [k for k, _ in SHAPE_INPUTS["箱涵"]]
+            left_keys  = param_keys[:4]
+            right_keys = param_keys[4:]
+            col_l, col_r = st.columns(2)
+            for k, label in [(k, lbl) for k, lbl in SHAPE_INPUTS["箱涵"] if k in left_keys]:
+                shape_vals[k] = col_l.number_input(
+                    label, value=BOX_DEFAULTS[k], format="%.4f", key=f"sv_{k}"
+                )
+            for k, label in [(k, lbl) for k, lbl in SHAPE_INPUTS["箱涵"] if k in right_keys]:
+                shape_vals[k] = col_r.number_input(
+                    label, value=BOX_DEFAULTS[k], format="%.4f", key=f"sv_{k}"
+                )
+            # ── Plotly 即時預覽 ────────────────────────────────────────────
+            bv = shape_vals
+            n  = bv["n_cell"]
+            bt, bb_w = bv["b_top"], bv["b_bot"]
+            hv = bv["h"]
+            ct = bv["c_top"]
+            tw, tt, tb = bv["t_web"], bv["t_top"], bv["t_bot"]
+
+            fig = go.Figure()
+
+            # 外廓多邊形（梯形，頂寬 b_top，底寬 b_bot）
+            half_top = bt / 2
+            half_bot = bb_w / 2
+            outer_x = [-half_top, half_top, half_bot, -half_bot, -half_top]
+            outer_y = [hv,        hv,       0,         0,          hv]
+            fig.add_trace(go.Scatter(
+                x=outer_x, y=outer_y, fill="toself",
+                fillcolor="rgba(150,150,150,0.4)", line=dict(color="black", width=1.5),
+                showlegend=False, name="外廓",
+            ))
+
+            # 各室空腔（白色覆蓋）
+            b_box = bb_w - 2 * tw
+            s_cell = b_box / n
+            for i in range(n):
+                inner_x0 = -b_box / 2 + i * s_cell
+                inner_x1 = inner_x0 + s_cell
+                void_x = [inner_x0, inner_x1, inner_x1, inner_x0, inner_x0]
+                void_y = [tb, tb, hv - tt, hv - tt, tb]
+                fig.add_trace(go.Scatter(
+                    x=void_x, y=void_y, fill="toself",
+                    fillcolor="white", line=dict(color="rgba(100,100,100,0.5)", width=0.8),
+                    showlegend=False,
+                ))
+
+            # 尺寸標注
+            annotations = [
+                dict(x=0, y=hv + 0.05 * hv, ax=bt / 2, ay=hv + 0.05 * hv,
+                     xref="x", yref="y", axref="x", ayref="y",
+                     text=f"b_top={bt:.3f}m", showarrow=True, arrowhead=2,
+                     font=dict(size=11), arrowcolor="royalblue", arrowwidth=1.5),
+                dict(x=0, y=-0.08 * hv, ax=bb_w / 2, ay=-0.08 * hv,
+                     xref="x", yref="y", axref="x", ayref="y",
+                     text=f"b_bot={bb_w:.3f}m", showarrow=True, arrowhead=2,
+                     font=dict(size=11), arrowcolor="royalblue", arrowwidth=1.5),
+                dict(x=half_top + 0.05 * bt, y=hv / 2, ax=half_top + 0.05 * bt, ay=0,
+                     xref="x", yref="y", axref="x", ayref="y",
+                     text=f"h={hv:.3f}m", showarrow=True, arrowhead=2,
+                     font=dict(size=11), arrowcolor="seagreen", arrowwidth=1.5),
+                dict(x=half_top - ct / 2, y=hv + 0.12 * hv, ax=0, ay=0,
+                     xref="x", yref="y", axref="x", ayref="y",
+                     text=f"c_top={ct:.3f}m", showarrow=True, arrowhead=2,
+                     font=dict(size=10), arrowcolor="darkorange", arrowwidth=1.5),
+            ]
+
+            fig.update_layout(
+                annotations=annotations,
+                xaxis=dict(visible=False, scaleanchor="y"),
+                yaxis=dict(visible=False),
+                margin=dict(l=10, r=10, t=10, b=10),
+                height=300,
+                plot_bgcolor="white",
+            )
+            st.plotly_chart(fig, use_container_width=True)
+
+        else:
+            cols = st.columns(len(SHAPE_INPUTS[shape_sel]))
+            for col, (k, label) in zip(cols, SHAPE_INPUTS[shape_sel]):
+                shape_vals[k] = col.number_input(label, value=0.1, format="%.4f", key=f"sv_{k}")
         if st.button("計算並填入", key="calc_shape"):
             try:
                 props = compute_section_props(shape_sel, shape_vals)
@@ -193,6 +329,7 @@ with left_panel:
     )
 
     # section 帶入 + override 偵測
+    import json as _json
     sec_map_ui = {s["name"]: s for s in st.session_state["sections"]}
     mat_map_ui = {m["name"]: m for m in st.session_state["materials"]}
 
@@ -204,16 +341,6 @@ with left_panel:
             m = mat_map_ui.get(s.get("material", ""), {})
             return m.get(field)
         return s.get(field)
-
-    def _is_override(row):
-        sn = row.get("section", "")
-        if not sn or sn not in sec_map_ui:
-            return False
-        for field in ("E", "G", "A", "I33", "I22", "J"):
-            ref = _sec_val(sn, field)
-            if ref is not None and abs(float(row.get(field, ref)) - ref) > ref * 1e-9:
-                return True
-        return False
 
     # Initialize tracking dict if needed
     if "elem_prev_section" not in st.session_state:
@@ -235,19 +362,19 @@ with left_panel:
 
         # Update tracking
         st.session_state["elem_prev_section"][str(elem_id)] = sn
-
-        r["status"] = "【修改】" if _is_override(r) else ""
         updated_rows.append(r)
+
+    # 用快取函式批次判斷哪些 element 被覆蓋（輸入不變時不重算）
+    _secs_json  = _json.dumps(st.session_state["sections"],  sort_keys=True)
+    _mats_json  = _json.dumps(st.session_state["materials"], sort_keys=True)
+    _elems_json = _json.dumps(updated_rows, sort_keys=True)
+    _overridden_ids = set(_check_override(_secs_json, _mats_json, _elems_json))
+    for r in updated_rows:
+        r["status"] = "【修改】" if str(r.get("id", "")) in _overridden_ids else ""
 
     elements_df_styled = pd.DataFrame(updated_rows)
 
-    def _highlight_override(row):
-        return ["background-color: #FFE0B2" if row.get("status") == "【修改】" else "" for _ in row]
-
-    st.dataframe(
-        elements_df_styled.style.apply(_highlight_override, axis=1),
-        use_container_width=True,
-    )
+    st.dataframe(elements_df_styled, use_container_width=True)
     elements_df = elements_df_styled  # 後續分析使用帶入後的版本
 
     st.subheader("支承 (Supports)")
@@ -296,12 +423,12 @@ with left_panel:
 
     cache_valid = bool(st.session_state["sym_cache"].get("raw_result"))
     if cache_valid:
-        current_fp = build_geometry_fingerprint({
-            "nodes": nodes_df.dropna(subset=['id']).fillna(0).to_dict('records'),
-            "elements": elements_df.dropna(subset=['id','i','j']).fillna(0).to_dict('records'),
-            "supports": supports_df.dropna(subset=['node_id']).fillna(False).to_dict('records'),
-            "loads": [], "element_loads": [], "element_point_loads": [],
-        })
+        import json as _json
+        current_fp = _compute_fingerprint(
+            _json.dumps(nodes_df.dropna(subset=['id']).fillna(0).to_dict('records'), sort_keys=True),
+            _json.dumps(elements_df.dropna(subset=['id','i','j']).fillna(0).to_dict('records'), sort_keys=True),
+            _json.dumps(supports_df.dropna(subset=['node_id']).fillna(False).to_dict('records'), sort_keys=True),
+        )
         cache_valid = (current_fp == st.session_state["sym_cache"].get("fingerprint"))
 
     st.caption("快速代入：幾何與支承不變時，直接代入新材料/載重參數，無需重新求符號解。")
