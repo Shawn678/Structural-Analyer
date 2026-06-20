@@ -181,3 +181,61 @@ def test_symbolic_no_section_sym_map_still_works():
     raw = run_symbolic_analysis(BEAM_2SEC)
     assert "node_displacements" in raw
     assert len(raw["node_displacements"]) == 3
+
+# ── 箱涵斷面 ───────────────────────────────────────────────────────────────
+
+def _box_params_1cell():
+    return dict(b_top=2.0, b_bot=1.6, h=1.2,
+                t_top=0.2, t_bot=0.2, t_web=0.2, t_dia=0.15,
+                n_cell=1, c_top=0.2)
+
+def test_box_girder_1cell_area():
+    """n_cell=1 單室：面積 = 頂板 + 底板 + 2×腹板（無內隔板）"""
+    p = _box_params_1cell()
+    hw = p["h"] - p["t_top"] - p["t_bot"]          # 0.8
+    expected_A = (p["b_top"] * p["t_top"]           # 頂板（含懸臂）
+                + p["b_bot"] * p["t_bot"]            # 底板
+                + 2 * p["t_web"] * hw)               # 2×外腹板
+    result = compute_section_props("箱涵", p)
+    assert abs(result["A"] - expected_A) < 1e-10
+
+def test_box_girder_1cell_J_positive():
+    p = _box_params_1cell()
+    result = compute_section_props("箱涵", p)
+    assert result["J"] > 0
+
+def test_box_girder_1cell_I33_positive():
+    p = _box_params_1cell()
+    result = compute_section_props("箱涵", p)
+    assert result["I33"] > 0
+
+def test_box_girder_1cell_I22_symmetric():
+    """c_top=0 時 I22 應與左右對稱斷面一致（用 b_top==b_bot 且 c_top=0 驗證）"""
+    p = dict(b_top=1.6, b_bot=1.6, h=1.2,
+             t_top=0.2, t_bot=0.2, t_web=0.2, t_dia=0.15,
+             n_cell=1, c_top=0.0)
+    result = compute_section_props("箱涵", p)
+    assert result["I22"] > 0
+
+def test_box_girder_3cell_area():
+    """n_cell=3：面積含 2 條內隔板"""
+    p = dict(b_top=6.0, b_bot=5.0, h=2.0,
+             t_top=0.25, t_bot=0.25, t_web=0.3, t_dia=0.2,
+             n_cell=3, c_top=0.5)
+    hw = p["h"] - p["t_top"] - p["t_bot"]
+    expected_A = (p["b_top"] * p["t_top"]
+                + p["b_bot"] * p["t_bot"]
+                + 2 * p["t_web"] * hw
+                + (p["n_cell"] - 1) * p["t_dia"] * hw)
+    result = compute_section_props("箱涵", p)
+    assert abs(result["A"] - expected_A) < 1e-10
+
+def test_box_girder_3cell_J_greater_than_1cell():
+    """多室 J 應大於單室（相同外廓下）"""
+    base = dict(b_top=6.0, b_bot=5.0, h=2.0,
+                t_top=0.25, t_bot=0.25, t_web=0.3, t_dia=0.2, c_top=0.5)
+    p1 = {**base, "n_cell": 1}
+    p3 = {**base, "n_cell": 3}
+    j1 = compute_section_props("箱涵", p1)["J"]
+    j3 = compute_section_props("箱涵", p3)["J"]
+    assert j3 > j1

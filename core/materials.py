@@ -59,6 +59,99 @@ def compute_section_props(shape: str, params: dict) -> dict:
         I22 = 2*(tf*bf**3/12) + bw*tw**3/12
         J   = (1/3) * (2*bf*tf**3 + bw*tw**3)
         return {"A": A, "I33": I33, "I22": I22, "J": J}
+    if shape == "箱涵":
+        import numpy as np
+        b_top = float(params["b_top"])
+        b_bot = float(params["b_bot"])
+        h     = float(params["h"])
+        t_top = float(params["t_top"])
+        t_bot = float(params["t_bot"])
+        t_web = float(params["t_web"])
+        t_dia = float(params["t_dia"])
+        n     = int(params["n_cell"])
+        c_top = float(params["c_top"])
+
+        hw = h - t_top - t_bot                          # 腹板淨高
+        b_box = b_bot - 2 * t_web                       # 底板內淨寬
+
+        # ── 面積 ──────────────────────────────────────
+        A = (b_top * t_top
+             + b_bot * t_bot
+             + 2 * t_web * hw
+             + (n - 1) * t_dia * hw)
+
+        # ── 形心高度（由底部量起）─────────────────────
+        pieces = [
+            (b_top * t_top,            h - t_top / 2),          # 頂板
+            (b_bot * t_bot,            t_bot / 2),               # 底板
+            (t_web * hw,               t_bot + hw / 2),          # 左外腹板
+            (t_web * hw,               t_bot + hw / 2),          # 右外腹板
+        ]
+        for _ in range(n - 1):
+            pieces.append((t_dia * hw, t_bot + hw / 2))          # 內隔板
+
+        y_bar = sum(a * y for a, y in pieces) / A
+
+        # ── I33（對水平形心軸）────────────────────────
+        def _rect_I33(b, hh, y_piece):
+            return b * hh**3 / 12 + b * hh * (y_piece - y_bar)**2
+
+        I33 = (_rect_I33(b_top, t_top, h - t_top / 2)
+               + _rect_I33(b_bot, t_bot, t_bot / 2)
+               + 2 * _rect_I33(t_web, hw, t_bot + hw / 2)
+               + (n - 1) * _rect_I33(t_dia, hw, t_bot + hw / 2))
+
+        # ── I22（對垂直形心軸，原點取箱涵幾何中心 x=0）────
+        # 箱涵幾何：左外腹板內緣 x = -b_box/2，右 x = +b_box/2
+        # 各室隔板均分，間距 s = b_box / n
+        s = b_box / n
+
+        def _rect_I22(hh, bb, x_c):
+            return hh * bb**3 / 12 + hh * bb * x_c**2
+
+        # 頂板（含懸臂）：全寬 b_top，形心在 x=0
+        I22 = _rect_I22(t_top, b_top, 0.0)
+        # 底板：全寬 b_bot，形心在 x=0
+        I22 += _rect_I22(t_bot, b_bot, 0.0)
+        # 左外腹板：形心 x = -(b_box/2 + t_web/2)
+        I22 += _rect_I22(hw, t_web, -(b_box / 2 + t_web / 2))
+        # 右外腹板：形心 x = +(b_box/2 + t_web/2)
+        I22 += _rect_I22(hw, t_web,  (b_box / 2 + t_web / 2))
+        # 內隔板：x 位置均分
+        for k in range(1, n):
+            x_dia = -b_box / 2 + k * s
+            I22 += _rect_I22(hw, t_dia, x_dia)
+
+        # ── J（Bredt 多室薄壁）────────────────────────
+        # 每室封閉面積 Ak = s × hw（底板側均分）
+        Ak = s * hw
+
+        # 建立 n×n 聯立方程 [C]{q} = {2Ak}
+        # C[i,i] = Σ(ds/t) 沿第 i 室周長
+        # C[i,i-1] = C[i,i+1] = -hw / t_dia（共用隔板）
+        C = np.zeros((n, n))
+        for i in range(n):
+            # 頂板段：s / t_top
+            # 底板段：s / t_bot
+            # 外腹板（最左室 i=0 或最右室 i=n-1）：hw / t_web
+            # 內隔板（左側共用）：hw / t_dia
+            # 內隔板（右側共用）：hw / t_dia
+            seg_top = s / t_top
+            seg_bot = s / t_bot
+            seg_left  = (hw / t_web) if i == 0     else (hw / t_dia)
+            seg_right = (hw / t_web) if i == n - 1 else (hw / t_dia)
+            C[i, i] = seg_top + seg_bot + seg_left + seg_right
+            if i > 0:
+                C[i, i - 1] = -hw / t_dia
+            if i < n - 1:
+                C[i, i + 1] = -hw / t_dia
+
+        rhs = np.full(n, 2 * Ak)
+        q = np.linalg.solve(C, rhs)
+        J = float(np.dot(q, np.full(n, 2 * Ak)))
+
+        return {"A": A, "I33": I33, "I22": I22, "J": J}
+
     raise ValueError(f"未知截面形狀: {shape}")
 
 
