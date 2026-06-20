@@ -130,6 +130,11 @@ with left_panel:
             ("c_top", "頂板懸臂長 c_top (m)"),
         ],
     }
+    BOX_DEFAULTS = {
+        "b_top": 6.0, "b_bot": 5.0, "h": 2.0,
+        "t_top": 0.25, "t_bot": 0.25, "t_web": 0.3,
+        "t_dia": 0.2, "c_top": 0.5,
+    }
 
     sec_df = st.data_editor(
         pd.DataFrame(st.session_state["sections"]) if st.session_state["sections"]
@@ -163,11 +168,6 @@ with left_panel:
             shape_vals["n_cell"] = st.selectbox(
                 "室數 n_cell", options=[1, 2, 3, 4, 5], key="sv_n_cell"
             )
-            BOX_DEFAULTS = {
-                "b_top": 6.0, "b_bot": 5.0, "h": 2.0,
-                "t_top": 0.25, "t_bot": 0.25, "t_web": 0.3,
-                "t_dia": 0.2, "c_top": 0.5,
-            }
             param_keys = [k for k, _ in SHAPE_INPUTS["箱涵"]]
             left_keys  = param_keys[:4]
             right_keys = param_keys[4:]
@@ -507,6 +507,93 @@ with left_panel:
                 st.warning("超過 5 個斷面組，表格可能較長，請捲動查看。")
         else:
             st.info("請先在桿件表格中指派斷面，才能使用快速代入。")
+
+        with st.expander("從形狀計算截面參數（填入快速代入表格）", expanded=False):
+            st.caption(
+                "計算結果**只填入上方快速代入表格**，不影響左側的截面定義。\n"
+                "⚠️ J 計算公式同左側截面管理區（矩形實心用 Timoshenko 近似等）。"
+            )
+            _qf_calc_target = st.selectbox(
+                "填入斷面", options=_qf_sec_names, key="qf_calc_target"
+            ) if _qf_sec_names else None
+
+            _qf_shape_sel = st.selectbox(
+                "截面形狀", options=list(SHAPE_INPUTS.keys()), key="qf_shape_sel"
+            )
+            _qf_shape_vals = {}
+
+            if _qf_shape_sel == "箱涵":
+                _qf_shape_vals["n_cell"] = st.selectbox(
+                    "室數 n_cell", options=[1, 2, 3, 4, 5], key="qf_sv_n_cell"
+                )
+                param_keys = [k for k, _ in SHAPE_INPUTS["箱涵"]]
+                left_keys  = param_keys[:4]
+                right_keys = param_keys[4:]
+                qf_col_l, qf_col_r = st.columns(2)
+                for k, label in [(k, lbl) for k, lbl in SHAPE_INPUTS["箱涵"] if k in left_keys]:
+                    _qf_shape_vals[k] = qf_col_l.number_input(
+                        label, value=BOX_DEFAULTS[k], format="%.4f", key=f"qf_sv_{k}"
+                    )
+                for k, label in [(k, lbl) for k, lbl in SHAPE_INPUTS["箱涵"] if k in right_keys]:
+                    _qf_shape_vals[k] = qf_col_r.number_input(
+                        label, value=BOX_DEFAULTS[k], format="%.4f", key=f"qf_sv_{k}"
+                    )
+                # ── 箱涵 Plotly 即時預覽（同左側計算器，複製邏輯）────────────────
+                bv = _qf_shape_vals
+                n_qf  = bv["n_cell"]
+                bt_qf = bv["b_top"]; bb_qf = bv["b_bot"]
+                hv_qf = bv["h"];     ct_qf = bv["c_top"]
+                tw_qf = bv["t_web"]; tt_qf = bv["t_top"]; tb_qf = bv["t_bot"]
+
+                fig_qf = go.Figure()
+                half_top_qf = bt_qf / 2
+                half_bot_qf = bb_qf / 2
+                fig_qf.add_trace(go.Scatter(
+                    x=[-half_top_qf, half_top_qf, half_bot_qf, -half_bot_qf, -half_top_qf],
+                    y=[hv_qf, hv_qf, 0, 0, hv_qf],
+                    fill="toself", fillcolor="rgba(150,150,150,0.4)",
+                    line=dict(color="black", width=1.5), showlegend=False,
+                ))
+                b_box_qf = bb_qf - 2 * tw_qf
+                s_cell_qf = b_box_qf / n_qf
+                for i in range(n_qf):
+                    ix0 = -b_box_qf / 2 + i * s_cell_qf
+                    ix1 = ix0 + s_cell_qf
+                    fig_qf.add_trace(go.Scatter(
+                        x=[ix0, ix1, ix1, ix0, ix0],
+                        y=[tb_qf, tb_qf, hv_qf - tt_qf, hv_qf - tt_qf, tb_qf],
+                        fill="toself", fillcolor="white",
+                        line=dict(color="rgba(100,100,100,0.5)", width=0.8), showlegend=False,
+                    ))
+                fig_qf.update_layout(
+                    xaxis=dict(visible=False, scaleanchor="y"),
+                    yaxis=dict(visible=False),
+                    margin=dict(l=10, r=10, t=10, b=10),
+                    height=250, plot_bgcolor="white",
+                )
+                st.plotly_chart(fig_qf, use_container_width=True)
+            else:
+                _qf_cols = st.columns(len(SHAPE_INPUTS[_qf_shape_sel]))
+                for col, (k, label) in zip(_qf_cols, SHAPE_INPUTS[_qf_shape_sel]):
+                    _qf_shape_vals[k] = col.number_input(
+                        label, value=0.1, format="%.4f", key=f"qf_sv_{k}"
+                    )
+
+            if st.button("計算並填入快速代入表格", key="qf_calc_btn") and _qf_calc_target:
+                try:
+                    _qf_props = compute_section_props(_qf_shape_sel, _qf_shape_vals)
+                    st.session_state["quickfill_overrides"][_qf_calc_target].update({
+                        "A":   _qf_props["A"],
+                        "I33": _qf_props["I33"],
+                    })
+                    st.success(
+                        f"已填入 {_qf_calc_target}：A={_qf_props['A']:.4e} m²，"
+                        f"I33={_qf_props['I33']:.4e} m⁴（G 維持原值）。"
+                    )
+                    st.session_state.pop("qf_editor", None)
+                    st.rerun()
+                except Exception as ex:
+                    st.error(f"計算失敗：{ex}")
 
         _qf_col1, _qf_col2 = st.columns(2)
         pe_P = _qf_col1.number_input("P 倍率", value=1.0, key="pe_P")
