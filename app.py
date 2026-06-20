@@ -11,7 +11,7 @@ from core.parametric_evaluator import (
     export_cache_to_txt,
     import_cache_from_txt,
 )
-from core.materials import compute_section_props, expand_truss_data
+from core.materials import compute_section_props, expand_truss_data, compute_self_weight
 
 st.set_page_config(page_title="Structural Analysis", layout="wide")
 
@@ -215,16 +215,27 @@ with left_panel:
                 return True
         return False
 
+    # Initialize tracking dict if needed
+    if "elem_prev_section" not in st.session_state:
+        st.session_state["elem_prev_section"] = {}
+
     updated_rows = []
     for _, row in elements_df.iterrows():
         r = row.to_dict()
+        elem_id = r.get("id", "")
         sn = r.get("section", "")
-        # 自動帶入（只在值為 0 時帶入，避免覆蓋 override）
-        if sn and sn in sec_map_ui:
+        prev_sn = st.session_state["elem_prev_section"].get(str(elem_id), None)
+
+        # Auto-fill when section changes (including first selection)
+        if sn and sn in sec_map_ui and sn != prev_sn:
             for field in ("E", "G", "A", "I33", "I22", "J"):
                 ref = _sec_val(sn, field)
-                if ref is not None and r.get(field, 0) == 0:
+                if ref is not None:
                     r[field] = ref
+
+        # Update tracking
+        st.session_state["elem_prev_section"][str(elem_id)] = sn
+
         r["status"] = "【修改】" if _is_override(r) else ""
         updated_rows.append(r)
 
@@ -368,6 +379,17 @@ with right_panel:
     if num_btn:
         try:
             _td_num = expand_truss_data(truss_data, st.session_state["materials"], st.session_state["sections"]) if st.session_state["sections"] else truss_data
+            if include_sw and st.session_state["sections"]:
+                import copy as _copy
+                _td_num = _copy.deepcopy(_td_num)
+                sw = compute_self_weight(_td_num, st.session_state["sections"], st.session_state["materials"])
+                _existing = {el["element_id"]: el for el in _td_num.get("element_loads", [])}
+                for _sw in sw:
+                    _eid = _sw["element_id"]
+                    if _eid in _existing:
+                        _existing[_eid]["w"] = _existing[_eid].get("w", 0.0) + _sw["w"]
+                    else:
+                        _td_num["element_loads"].append({"element_id": _eid, "w": _sw["w"]})
             res_eval = evaluate_numerical_results(_td_num)
             output_area.json(res_eval)
             st.info(f"數值分析完成，耗時 {res_eval['eval_time_ms']} ms（直接代入實際參數）。")
