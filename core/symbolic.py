@@ -246,7 +246,7 @@ def _fit_and_symbolize(samples_P, samples_w, basis_P, basis_w,
     w_sym  = sym_vars['w']
     L_syms = sym_vars['L_syms']
 
-    # 每桿件符號（有 section_sym_map 時各異，否則全域共用）
+    # 每桿件符號（有 section_group_map 時各異，否則全域共用）
     elem_E_syms = sym_vars.get('elem_E_syms', None)
     elem_A_syms = sym_vars.get('elem_A_syms', None)
     elem_I_syms = sym_vars.get('elem_I_syms', None)
@@ -321,13 +321,13 @@ def _fit_and_symbolize(samples_P, samples_w, basis_P, basis_w,
 # 主分析函式
 # ==============================================================================
 
-def run_symbolic_analysis(truss_data: dict, section_sym_map: dict | None = None) -> dict:
+def run_symbolic_analysis(truss_data: dict, section_group_map: dict | None = None) -> dict:
     """
     執行結構分析，輸出含 E, A, I, L_k, P, w 的全代數符號公式。
     策略：多點數值採樣 + 力學基底 lstsq 擬合 + SymPy 符號組裝。
 
-    section_sym_map: {elem_id: {"E": sp.Symbol, "A": sp.Symbol, "I33": sp.Symbol,
-                                "I22": sp.Symbol, "J": sp.Symbol, "G": sp.Symbol}}
+    section_group_map: {elem_id: {"E": sp.Symbol, "A": sp.Symbol, "I33": sp.Symbol,
+                                  "I22": sp.Symbol, "J": sp.Symbol, "G": sp.Symbol}}
         當提供此 map 時，每根桿件使用各自的符號而非全域 E/A/I/G。
     """
     start_time = time.time()
@@ -359,7 +359,7 @@ def run_symbolic_analysis(truss_data: dict, section_sym_map: dict | None = None)
     n_elem   = len(elem_Ls)
     L_syms   = [sp.Symbol(f'L_{k+1}') for k in range(n_elem)]
 
-    # 建立每根桿件的符號（有 section_sym_map 時使用各自符號，否則共用全域符號）
+    # 建立每根桿件的符號（有 section_group_map 時使用各自符號，否則共用全域符號）
     elem_E_syms   = []
     elem_A_syms   = []
     elem_I_syms   = []
@@ -368,8 +368,8 @@ def run_symbolic_analysis(truss_data: dict, section_sym_map: dict | None = None)
     elem_G_syms   = []
     for info in elements_info:
         eid = info['id']
-        if section_sym_map and eid in section_sym_map:
-            sym = section_sym_map[eid]
+        if section_group_map and eid in section_group_map:
+            sym = section_group_map[eid]
             elem_E_syms.append(sym['E'])
             elem_A_syms.append(sym['A'])
             elem_I_syms.append(sym['I33'])
@@ -483,8 +483,8 @@ def run_symbolic_analysis(truss_data: dict, section_sym_map: dict | None = None)
     F_P_np_free = np.array([float(F_P_sym[d, 0].subs(P_sym, 1)) for d in free_dofs])
     F_w_np_free = np.array([float(F_w_sym[d, 0].subs(w_sym, 1)) for d in free_dofs])
 
-    # 當使用 section_sym_map 時，預先取出每根桿件的實際材料參數（用於 basis 建立）
-    if section_sym_map:
+    # 當使用 section_group_map 時，預先取出每根桿件的實際材料參數（用於 basis 建立）
+    if section_group_map:
         _elem_map = {e['id']: e for e in truss_data['elements']}
         per_elem_E = [_to_float(_elem_map[info['id']].get('E',   E_base), E_base) for info in elements_info]
         per_elem_A = [_to_float(_elem_map[info['id']].get('A',   A_base), A_base) for info in elements_info]
@@ -682,10 +682,19 @@ def run_symbolic_analysis(truss_data: dict, section_sym_map: dict | None = None)
 
     print(f"-> [Step 4/4] 完成！總耗時: {time.time()-start_time:.2f}s")
 
+    # 收集斷面組資訊，供快取失效比對與 subs_dict 重建
+    _sec_groups = sorted(section_group_map.keys()) if section_group_map else []
+    _sec_sym_names = {}
+    if section_group_map:
+        for sn, syms in section_group_map.items():
+            _sec_sym_names[sn] = {k: str(v) for k, v in syms.items()}
+
     result = {
         "node_displacements": node_displacements,
         "element_forces":     element_forces,
         "support_reactions":  support_reactions,
+        "section_groups":     _sec_groups,
+        "section_sym_names":  _sec_sym_names,
     }
     if any_invalid:
         result["warning"] = "部分DOF擬合殘差超過閾值，符號公式可能不精確，建議檢查結構是否含相同長度桿件。"

@@ -167,7 +167,7 @@ SECTION_SYM_MAP = {
 }
 
 def test_symbolic_per_section_formula_contains_both_symbols():
-    raw = run_symbolic_analysis(BEAM_2SEC, section_sym_map=SECTION_SYM_MAP)
+    raw = run_symbolic_analysis(BEAM_2SEC, section_group_map=SECTION_SYM_MAP)
     # 至少一個節點位移公式應包含兩個 section 的符號（結構在 XY 平面，uy/ux/rz 為主要自由度）
     all_formulas = " ".join(
         nd.get("ux","0") + nd.get("uy","0") + nd.get("theta_z","0")
@@ -177,7 +177,7 @@ def test_symbolic_per_section_formula_contains_both_symbols():
     assert "E_s1" in all_formulas or "A_s1" in all_formulas or "I33_s1" in all_formulas
 
 def test_symbolic_no_section_sym_map_still_works():
-    # 不傳 section_sym_map 時，行為與原來相同（全域 E/A/I/G 符號）
+    # 不傳 section_group_map 時，行為與原來相同（全域 E/A/I/G 符號）
     raw = run_symbolic_analysis(BEAM_2SEC)
     assert "node_displacements" in raw
     assert len(raw["node_displacements"]) == 3
