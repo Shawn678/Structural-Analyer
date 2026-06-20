@@ -201,6 +201,22 @@ def _assemble_K_np(truss_data, E_s, A_s, I_s, G_s):
     return K_np, elements_info, nodes_coords, free_dofs
 
 
+def _make_cross_samples(n_groups: int, base_vals: list, n_samples: int, seed: int = 42) -> list:
+    """
+    為每個斷面組獨立產生 scale 序列（Hadamard 交叉採樣）。
+    回傳 shape=(n_samples, n_groups) 的 list-of-list，每格是該採樣點該組的 scale 倍率。
+    base_vals: [{"E": float, "A": float, "I": float, "G": float}, ...]，長度 = n_groups
+    注意：base_vals 僅保留介面一致性，實際 scale 倍率為全域基準值的倍數。
+    """
+    SCALES = [1.0, 5.0, 25.0, 100.0, 500.0]
+    rng = np.random.default_rng(seed)
+    result = []
+    for _ in range(n_samples):
+        row = [SCALES[rng.integers(0, len(SCALES))] for _ in range(n_groups)]
+        result.append(row)
+    return result
+
+
 def _build_basis_row(elem_Ls, E_s, A_s, I_s, G_s, mode,
                      elem_E_list=None, elem_A_list=None,
                      elem_I_list=None, elem_G_list=None):
@@ -360,6 +376,10 @@ def run_symbolic_analysis(truss_data: dict, section_group_map: dict | None = Non
     L_syms   = [sp.Symbol(f'L_{k+1}') for k in range(n_elem)]
 
     # 建立每根桿件的符號（有 section_group_map 時使用各自符號，否則共用全域符號）
+    # section_group_map 支援兩種 key 類型：
+    #   整數 key（element ID）：直接以 eid 查表
+    #   字串 key（section 名稱）：以桿件的 "section" 欄位查表
+    _raw_elem_by_id = {e['id']: e for e in truss_data['elements']}
     elem_E_syms   = []
     elem_A_syms   = []
     elem_I_syms   = []
@@ -368,8 +388,17 @@ def run_symbolic_analysis(truss_data: dict, section_group_map: dict | None = Non
     elem_G_syms   = []
     for info in elements_info:
         eid = info['id']
-        if section_group_map and eid in section_group_map:
-            sym = section_group_map[eid]
+        sym = None
+        if section_group_map:
+            if eid in section_group_map:
+                # 整數 key 路徑（既有行為）
+                sym = section_group_map[eid]
+            else:
+                # 字串 key 路徑：依桿件的 section 名稱查表
+                sec_name = _raw_elem_by_id.get(eid, {}).get('section', '')
+                if sec_name and sec_name in section_group_map:
+                    sym = section_group_map[sec_name]
+        if sym is not None:
             elem_E_syms.append(sym['E'])
             elem_A_syms.append(sym['A'])
             elem_I_syms.append(sym['I33'])
@@ -474,44 +503,118 @@ def run_symbolic_analysis(truss_data: dict, section_group_map: dict | None = Non
         extra = np.logspace(0, 4, n_samples - len(SAMPLE_SCALES) + 1)[1:].tolist()
         SAMPLE_SCALES = SAMPLE_SCALES + [s * 10 for s in extra[:n_samples - len(SAMPLE_SCALES)]]
 
+    # F_P/F_w 只含 P/w 線性係數，不隨材料 scale 變化，迴圈外算一次
+    F_P_np_free = np.array([float(F_P_sym[d, 0].subs(P_sym, 1)) for d in free_dofs])
+    F_w_np_free = np.array([float(F_w_sym[d, 0].subs(w_sym, 1)) for d in free_dofs])
+
+    # ── 判斷採樣模式 ─────────────────────────────────────────────────────────
+    # section_group_map 有兩種可能的 key 類型（由呼叫端決定）：
+    #   (A) 整數 key（element ID）：既有路徑，全域均勻 scale 擾動
+    #   (B) 字串 key（section 名稱）：Task 2 新路徑，Hadamard 交叉採樣
+    # 判斷方式：检查第一個 key 是否為 str
+    _group_names = []
+    if section_group_map:
+        first_key = next(iter(section_group_map))
+        if isinstance(first_key, str):
+            # (B) 字串 key：section name → 啟用 Hadamard 交叉採樣
+            _group_names = sorted(section_group_map.keys())
+    _n_groups = len(_group_names)
+
+    # 當使用 section_group_map（任意 key 類型）時，
+    # 預先取出每根桿件的實際材料基準值（用於 basis 建立）
+    _elem_raw = {e['id']: e for e in truss_data['elements']}
+    if section_group_map:
+        per_elem_E = [_to_float(_elem_raw[info['id']].get('E',   E_base), E_base) for info in elements_info]
+        per_elem_A = [_to_float(_elem_raw[info['id']].get('A',   A_base), A_base) for info in elements_info]
+        per_elem_I = [_to_float(_elem_raw[info['id']].get('I33', _elem_raw[info['id']].get('I', I_base)), I_base) for info in elements_info]
+        per_elem_G = [_to_float(_elem_raw[info['id']].get('G',   G_base), G_base) for info in elements_info]
+    else:
+        per_elem_E = per_elem_A = per_elem_I = per_elem_G = None
+
+    # (B) Hadamard 交叉採樣前置：計算 n_samples 與交叉擾動矩陣
+    if _n_groups > 0:
+        n_samples = max(len(SAMPLE_SCALES), _n_groups * 4 + 4)
+        # 補齊 SAMPLE_SCALES 至 n_samples（保持陣列尺寸一致性）
+        if n_samples > len(SAMPLE_SCALES):
+            extra = np.logspace(0, 4, n_samples - len(SAMPLE_SCALES) + 1)[1:].tolist()
+            SAMPLE_SCALES = SAMPLE_SCALES + [s * 10 for s in extra[:n_samples - len(SAMPLE_SCALES)]]
+        # 取每組基準材料值（從屬於該組的第一根桿件）
+        _group_base = []
+        for gname in _group_names:
+            e0 = next((e for e in truss_data['elements'] if e.get('section') == gname), {})
+            _group_base.append({
+                'E': _to_float(e0.get('E',   E_base), E_base),
+                'A': _to_float(e0.get('A',   A_base), A_base),
+                'I': _to_float(e0.get('I33', e0.get('I', I_base)), I_base),
+                'G': _to_float(e0.get('G',   G_base), G_base),
+            })
+        _cross_scales = _make_cross_samples(_n_groups, _group_base, n_samples)
+
+    # 重新分配採樣陣列（n_samples 可能被 _n_groups 更新）
     samples_P_full = np.zeros((n_samples, total_dof))
     samples_w_full = np.zeros((n_samples, total_dof))
     basis_P_rows   = np.zeros((n_samples, n_elem * 5))
     basis_w_rows   = np.zeros((n_samples, n_elem * 2))
 
-    # F_P/F_w 只含 P/w 線性係數，不隨材料 scale 變化，迴圈外算一次
-    F_P_np_free = np.array([float(F_P_sym[d, 0].subs(P_sym, 1)) for d in free_dofs])
-    F_w_np_free = np.array([float(F_w_sym[d, 0].subs(w_sym, 1)) for d in free_dofs])
+    print(f"-> [Step 2/4] 開始 {n_samples} 組採樣（{'Hadamard 交叉' if _n_groups > 0 else '全域均勻'}模式）...")
+    for s_idx in range(n_samples):
+        if _n_groups > 0:
+            # (B) Hadamard 交叉採樣：每組使用獨立 scale，桿件依所屬 section 取對應 scale
+            scale_by_group = {gname: _cross_scales[s_idx][gi]
+                              for gi, gname in enumerate(_group_names)}
+            global_scale = float(np.mean(list(scale_by_group.values())))
 
-    # 當使用 section_group_map 時，預先取出每根桿件的實際材料參數（用於 basis 建立）
-    if section_group_map:
-        _elem_map = {e['id']: e for e in truss_data['elements']}
-        per_elem_E = [_to_float(_elem_map[info['id']].get('E',   E_base), E_base) for info in elements_info]
-        per_elem_A = [_to_float(_elem_map[info['id']].get('A',   A_base), A_base) for info in elements_info]
-        per_elem_I = [_to_float(_elem_map[info['id']].get('I33', _elem_map[info['id']].get('I', I_base)), I_base) for info in elements_info]
-        per_elem_G = [_to_float(_elem_map[info['id']].get('G',   G_base), G_base) for info in elements_info]
-    else:
-        per_elem_E = per_elem_A = per_elem_I = per_elem_G = None
-
-    print(f"-> [Step 2/4] 開始 {n_samples} 組採樣...")
-    for s_idx, scale in enumerate(SAMPLE_SCALES[:n_samples]):
-        E_s = E_base * scale
-        A_s = A_base * scale
-        I_s = I_base * scale
-        G_s = G_base * scale
-
-        if per_elem_E is not None:
-            # Scale element properties so K_s actually varies with scale
+            # 建立依 section 獨立縮放的 truss_data 副本
             td_scaled = copy.deepcopy(truss_data)
-            for k, elem in enumerate(td_scaled['elements']):
-                elem['E']   = per_elem_E[k] * scale
-                elem['A']   = per_elem_A[k] * scale
-                elem['I33'] = per_elem_I[k] * scale
-                elem['I22'] = per_elem_I[k] * scale  # approximate, same as current basis
-                elem['G']   = per_elem_G[k] * scale
+            elem_E_scaled = []
+            elem_A_scaled = []
+            elem_I_scaled = []
+            elem_G_scaled = []
+            raw_elems = {e['id']: e for e in truss_data['elements']}
+            for k, info in enumerate(elements_info):
+                raw_e = raw_elems[info['id']]
+                sn = raw_e.get('section', '')
+                sc = scale_by_group.get(sn, global_scale)
+                e_val = per_elem_E[k] * sc
+                a_val = per_elem_A[k] * sc
+                i_val = per_elem_I[k] * sc
+                g_val = per_elem_G[k] * sc
+                elem_E_scaled.append(e_val)
+                elem_A_scaled.append(a_val)
+                elem_I_scaled.append(i_val)
+                elem_G_scaled.append(g_val)
+                # 更新副本中的對應桿件（依位置索引對齊 elements_info）
+                td_scaled['elements'][k]['E']   = e_val
+                td_scaled['elements'][k]['A']   = a_val
+                td_scaled['elements'][k]['I33'] = i_val
+                td_scaled['elements'][k]['I22'] = i_val
+                td_scaled['elements'][k]['G']   = g_val
+            E_s = E_base * global_scale
+            A_s = A_base * global_scale
+            I_s = I_base * global_scale
+            G_s = G_base * global_scale
             K_s, elems_s, _, free_s = _assemble_K_np(td_scaled, E_s, A_s, I_s, G_s)
         else:
-            K_s, elems_s, _, free_s = _assemble_K_np(truss_data, E_s, A_s, I_s, G_s)
+            # (A) 原有邏輯：全域均勻 scale
+            scale = SAMPLE_SCALES[s_idx] if s_idx < len(SAMPLE_SCALES) else SAMPLE_SCALES[-1]
+            E_s = E_base * scale
+            A_s = A_base * scale
+            I_s = I_base * scale
+            G_s = G_base * scale
+
+            if per_elem_E is not None:
+                # element-ID keyed section_group_map：均勻縮放各桿件的實際屬性
+                td_scaled = copy.deepcopy(truss_data)
+                for k, elem in enumerate(td_scaled['elements']):
+                    elem['E']   = per_elem_E[k] * scale
+                    elem['A']   = per_elem_A[k] * scale
+                    elem['I33'] = per_elem_I[k] * scale
+                    elem['I22'] = per_elem_I[k] * scale
+                    elem['G']   = per_elem_G[k] * scale
+                K_s, elems_s, _, free_s = _assemble_K_np(td_scaled, E_s, A_s, I_s, G_s)
+            else:
+                K_s, elems_s, _, free_s = _assemble_K_np(truss_data, E_s, A_s, I_s, G_s)
+
         assert set(free_s) == set(free_dofs), f"採樣 {s_idx}: free_dof 集合在縮放下改變，請檢查結構輸入"
         K_red = K_s[np.ix_(free_s, free_s)]
 
@@ -526,8 +629,24 @@ def run_symbolic_analysis(truss_data: dict, section_group_map: dict | None = Non
             samples_P_full[s_idx, d] = U_P_s[i]
             samples_w_full[s_idx, d] = U_w_s[i]
 
-        if per_elem_E is not None:
-            # per-section 模式：basis 使用各桿件的實際材料參數（×scale 擾動）
+        if _n_groups > 0:
+            # Hadamard 模式：basis 使用各桿件的獨立縮放後材料參數
+            basis_P_rows[s_idx] = _build_basis_row(
+                elem_Ls, E_s, A_s, I_s, G_s, 'P',
+                elem_E_list=elem_E_scaled,
+                elem_A_list=elem_A_scaled,
+                elem_I_list=elem_I_scaled,
+                elem_G_list=elem_G_scaled,
+            )
+            basis_w_rows[s_idx] = _build_basis_row(
+                elem_Ls, E_s, A_s, I_s, G_s, 'w',
+                elem_E_list=elem_E_scaled,
+                elem_A_list=elem_A_scaled,
+                elem_I_list=elem_I_scaled,
+                elem_G_list=elem_G_scaled,
+            )
+        elif per_elem_E is not None:
+            # element-ID keyed path：basis 使用各桿件實際材料參數（×均勻 scale）
             basis_P_rows[s_idx] = _build_basis_row(
                 elem_Ls, E_s, A_s, I_s, G_s, 'P',
                 elem_E_list=[v * scale for v in per_elem_E],
