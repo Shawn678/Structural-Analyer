@@ -7,14 +7,23 @@ import sympy as sp
 from core.parametric_evaluator import (
     build_geometry_fingerprint,
     evaluate_real_results,
+    evaluate_numerical_results,
     export_cache_to_txt,
     import_cache_from_txt,
 )
+from core.materials import compute_section_props, expand_truss_data
 
 st.set_page_config(page_title="Structural Analysis", layout="wide")
 
 if "sym_cache" not in st.session_state:
     st.session_state["sym_cache"] = {}
+if "materials" not in st.session_state:
+    st.session_state["materials"] = [
+        {"name": "鋼材",   "E": 200e9, "G": 77e9, "density": 7850.0},
+        {"name": "混凝土", "E":  30e9, "G": 12.5e9, "density": 2400.0},
+    ]
+if "sections" not in st.session_state:
+    st.session_state["sections"] = []
 
 # 注入現有的 CSS 樣式
 
@@ -72,7 +81,79 @@ st.title("Structural Analysis 數據編輯")
 left_panel, right_panel = st.columns([1, 1.2])
 
 with left_panel:
+    st.subheader("材料 (Materials)")
+    mat_df_raw = pd.DataFrame(st.session_state["materials"])
+    mat_df_raw["ν (唯讀)"] = (mat_df_raw["E"] / (2 * mat_df_raw["G"]) - 1).round(4)
+    mat_df = st.data_editor(
+        mat_df_raw,
+        column_config={
+            "name":    st.column_config.TextColumn("名稱", width="small"),
+            "E":       st.column_config.NumberColumn("E (Pa)",     format="%.3e"),
+            "G":       st.column_config.NumberColumn("G (Pa)",     format="%.3e"),
+            "density": st.column_config.NumberColumn("密度 (kg/m³)", format="%.1f"),
+            "ν (唯讀)": st.column_config.NumberColumn("ν (唯讀)",   disabled=True),
+        },
+        num_rows="dynamic", key="mat_editor",
+    )
+    # 同步回 session_state（去掉唯讀欄）
+    st.session_state["materials"] = mat_df.drop(columns=["ν (唯讀)"], errors="ignore").dropna(subset=["name"]).to_dict("records")
+    mat_names = [m["name"] for m in st.session_state["materials"]]
+
+    st.subheader("截面 (Sections)")
+    SHAPE_OPTIONS = ["Custom", "矩形實心", "圓形實心", "矩形管", "圓管", "I形"]
+    SHAPE_INPUTS  = {
+        "矩形實心": [("b","寬 b (m)"),("h","高 h (m)")],
+        "圓形實心": [("d","直徑 d (m)")],
+        "矩形管":   [("b","寬 b (m)"),("h","高 h (m)"),("t","壁厚 t (m)")],
+        "圓管":     [("d","外徑 d (m)"),("t","壁厚 t (m)")],
+        "I形":      [("H","全高 H (m)"),("bf","翼板寬 bf (m)"),
+                     ("tf","翼板厚 tf (m)"),("tw","腹板厚 tw (m)")],
+    }
+
+    sec_df = st.data_editor(
+        pd.DataFrame(st.session_state["sections"]) if st.session_state["sections"]
+        else pd.DataFrame(columns=["name","material","shape","A","I33","I22","J"]),
+        column_config={
+            "name":     st.column_config.TextColumn("截面名稱", width="small"),
+            "material": st.column_config.SelectboxColumn("材料", options=mat_names),
+            "shape":    st.column_config.SelectboxColumn("形狀", options=SHAPE_OPTIONS),
+            "A":        st.column_config.NumberColumn("A (m²)",   format="%.4e"),
+            "I33":      st.column_config.NumberColumn("I33 (m⁴)", format="%.4e"),
+            "I22":      st.column_config.NumberColumn("I22 (m⁴)", format="%.4e"),
+            "J":        st.column_config.NumberColumn("J (m⁴)",   format="%.4e"),
+        },
+        num_rows="dynamic", key="sec_editor",
+    )
+    st.session_state["sections"] = sec_df.dropna(subset=["name"]).to_dict("records")
+    sec_names = [s["name"] for s in st.session_state["sections"]]
+
+    with st.expander("從形狀計算截面參數", expanded=False):
+        st.caption(
+            "⚠️ 矩形實心的 J 採用 Timoshenko 近似公式；"
+            "矩形管的 J 採用薄壁閉口近似；"
+            "I 形截面的 J 採用薄壁開口近似。精確值請查結構手冊。"
+        )
+        target_sec = st.selectbox("填入截面", options=sec_names, key="shape_target_sec")
+        shape_sel  = st.selectbox("截面形狀", options=list(SHAPE_INPUTS.keys()), key="shape_sel")
+        shape_vals = {}
+        cols = st.columns(len(SHAPE_INPUTS[shape_sel]))
+        for col, (k, label) in zip(cols, SHAPE_INPUTS[shape_sel]):
+            shape_vals[k] = col.number_input(label, value=0.1, format="%.4f", key=f"sv_{k}")
+        if st.button("計算並填入", key="calc_shape"):
+            try:
+                props = compute_section_props(shape_sel, shape_vals)
+                new_secs = []
+                for s in st.session_state["sections"]:
+                    if s["name"] == target_sec:
+                        s = {**s, "shape": shape_sel, **props}
+                    new_secs.append(s)
+                st.session_state["sections"] = new_secs
+                st.rerun()
+            except Exception as ex:
+                st.error(f"計算失敗：{ex}")
+
     st.subheader("節點 (Nodes)")
+    st.caption("座標單位：**m（公尺）**")
     nodes_df = st.data_editor(
         pd.DataFrame([
             {"id": 1, "x": 0.0, "y": 0.0, "z": 4.0}, # 梁左端
@@ -92,11 +173,71 @@ with left_panel:
     )
     elements_df = st.data_editor(
         pd.DataFrame([
-            {"id": 1, "i": 1, "j": 2, "E": 200e9, "G": 77e9, "A": 0.01, "I33": 1e-4, "I22": 1e-5, "J": 1e-5, "beta": 0.0, "dL": 0.0, "pin_i": False, "pin_j": False},
-            {"id": 2, "i": 2, "j": 3, "E": 200e9, "G": 77e9, "A": 0.01, "I33": 1e-4, "I22": 1e-5, "J": 1e-5, "beta": 0.0, "dL": 0.0, "pin_i": False, "pin_j": False},
-            {"id": 3, "i": 4, "j": 1, "E": 200e9, "G": 77e9, "A": 0.01, "I33": 1e-4, "I22": 1e-5, "J": 1e-5, "beta": 0.0, "dL": 0.0, "pin_i": False, "pin_j": False}
-        ]), num_rows="dynamic", key="elements"
+            {"id":1,"i":1,"j":2,"section":"","E":200e9,"G":77e9,"A":0.01,
+             "I33":1e-4,"I22":1e-5,"J":1e-5,"beta":0.0,"dL":0.0,
+             "pin_i":False,"pin_j":False,"status":""},
+            {"id":2,"i":2,"j":3,"section":"","E":200e9,"G":77e9,"A":0.01,
+             "I33":1e-4,"I22":1e-5,"J":1e-5,"beta":0.0,"dL":0.0,
+             "pin_i":False,"pin_j":False,"status":""},
+            {"id":3,"i":4,"j":1,"section":"","E":200e9,"G":77e9,"A":0.01,
+             "I33":1e-4,"I22":1e-5,"J":1e-5,"beta":0.0,"dL":0.0,
+             "pin_i":False,"pin_j":False,"status":""},
+        ]),
+        column_config={
+            "section": st.column_config.SelectboxColumn(
+                "截面", options=[""] + sec_names, width="small"
+            ),
+            "status": st.column_config.TextColumn("狀態", disabled=True, width="small"),
+        },
+        num_rows="dynamic", key="elements",
     )
+
+    # section 帶入 + override 偵測
+    sec_map_ui = {s["name"]: s for s in st.session_state["sections"]}
+    mat_map_ui = {m["name"]: m for m in st.session_state["materials"]}
+
+    def _sec_val(sec_name, field):
+        if sec_name not in sec_map_ui:
+            return None
+        s = sec_map_ui[sec_name]
+        if field in ("E", "G"):
+            m = mat_map_ui.get(s.get("material", ""), {})
+            return m.get(field)
+        return s.get(field)
+
+    def _is_override(row):
+        sn = row.get("section", "")
+        if not sn or sn not in sec_map_ui:
+            return False
+        for field in ("E", "G", "A", "I33", "I22", "J"):
+            ref = _sec_val(sn, field)
+            if ref is not None and abs(float(row.get(field, ref)) - ref) > ref * 1e-9:
+                return True
+        return False
+
+    updated_rows = []
+    for _, row in elements_df.iterrows():
+        r = row.to_dict()
+        sn = r.get("section", "")
+        # 自動帶入（只在值為 0 時帶入，避免覆蓋 override）
+        if sn and sn in sec_map_ui:
+            for field in ("E", "G", "A", "I33", "I22", "J"):
+                ref = _sec_val(sn, field)
+                if ref is not None and r.get(field, 0) == 0:
+                    r[field] = ref
+        r["status"] = "【修改】" if _is_override(r) else ""
+        updated_rows.append(r)
+
+    elements_df_styled = pd.DataFrame(updated_rows)
+
+    def _highlight_override(row):
+        return ["background-color: #FFE0B2" if row.get("status") == "【修改】" else "" for _ in row]
+
+    st.dataframe(
+        elements_df_styled.style.apply(_highlight_override, axis=1),
+        use_container_width=True,
+    )
+    elements_df = elements_df_styled  # 後續分析使用帶入後的版本
 
     st.subheader("支承 (Supports)")
     st.caption(
@@ -115,27 +256,32 @@ with left_panel:
     )
 
     st.subheader("載重 (Loads)")
+    st.caption("fx / fy / fz：**N（牛頓）**；mx / my / mz：**N·m（牛頓·公尺）**")
     loads_df = st.data_editor(
         pd.DataFrame([
-            {"node_id": 2, "fx": 0.0, "fy": 0.0, "fz": -10.0} # 集中載重在 Z 向
+            {"node_id": 2, "fx": 0.0, "fy": 0.0, "fz": -10.0}
         ]), num_rows="dynamic", key="loads"
     )
 
     st.subheader("桿件載重 (Element Loads)")
+    st.caption("w：均佈載重，單位 **N/m**，向下為負（與 Z 軸正方向相反）")
     e_loads_df = st.data_editor(
         pd.DataFrame([
-            {"element_id": 1, "w": -5.0} # 均佈載重向下 (Z向)
+            {"element_id": 1, "w": -5.0}
         ]), num_rows="dynamic", key="element_loads"
     )
 
     st.subheader("桿件集中載重 (Element Point Loads)")
+    st.caption("p：集中力 **N**；a：距 i 端距離 **m**")
     e_pt_loads_df = st.data_editor(
         pd.DataFrame([
             {"element_id": 1, "p": 0.0, "a": 0.0}
         ]), num_rows="dynamic", key="element_point_loads"
     )
 
+    include_sw = st.checkbox("含自重（Self-Weight）", value=False, key="include_sw")
     run_btn = st.button("執行分析（符號解）", type="primary", use_container_width=True)
+    num_btn = st.button("執行數值分析（直接代入）", use_container_width=True)
 
     cache_valid = bool(st.session_state["sym_cache"].get("raw_result"))
     if cache_valid:
@@ -159,9 +305,10 @@ with left_panel:
             pe_G = st.number_input("G (Pa)", value=77e9,  format="%.3e", key="pe_G")
             pe_w = st.number_input("w 倍率", value=0.0,   key="pe_w")
         st.caption(
-            "**注意：** 目前代數解中，位移與內力公式的係數為純數值比例（已含 E/A/I/G 的數值計算）。"
-            "快速代入**僅縮放 P（集中載重）與 w（均佈載重）的倍率**，修改 E/A/I/G 不會改變結果。"
-            "若需更換截面材料，請重新執行完整分析（符號解）。"
+            "**位移**：從符號公式直接代入 E/A/I/G/L，結果包含材料依賴性。\n"
+            "**內力與反力**：以輸入的 E/A/I/G 重新數值求解（使用快取跳過符號分析），"
+            "P 與 w 為載重倍率（相對於輸入表格中的數值）。\n"
+            "幾何或支承改變時請重新執行完整分析（符號解）以更新快取。"
         )
         fast_btn = st.button(
             "⚡ 代入參數（快速）",
@@ -218,11 +365,55 @@ with right_panel:
     output_area = st.empty()
     res_eval = None
 
+    if num_btn:
+        try:
+            _td_num = expand_truss_data(truss_data, st.session_state["materials"], st.session_state["sections"]) if st.session_state["sections"] else truss_data
+            res_eval = evaluate_numerical_results(_td_num)
+            output_area.json(res_eval)
+            st.info(f"數值分析完成，耗時 {res_eval['eval_time_ms']} ms（直接代入實際參數）。")
+        except Exception as e:
+            if "singular" in str(e).lower() or "not invertible" in str(e).lower():
+                st.error(f"分析失敗：結構不穩定 (奇異矩陣)。請檢查支承是否足夠。\n\n詳細錯誤: {e}")
+            else:
+                st.error(f"數值分析發生錯誤：{e}")
+            st.stop()
+
+        st.divider()
+        st.subheader("內力分佈圖 (Internal Force Diagrams)")
+        for force in res_eval['element_forces']:
+            with st.expander(f"桿件 {force['element_id']} 內力圖表", expanded=True):
+                Le = force['Le']
+                x_vals = np.linspace(0, Le, 100)
+                # N, V2 為常數；M3 由 i 端線性插值至 j 端
+                N_vals  = np.full_like(x_vals, force['N'])
+                V2_vals = np.full_like(x_vals, force['V2'])
+                M3_vals = force['M3_i'] + (force['M3_j'] - force['M3_i']) * x_vals / Le
+
+                fig = make_subplots(rows=1, cols=3, subplot_titles=("軸力圖 (ND)", "剪力圖 (V2)", "彎矩圖 (M3)"))
+                for col_idx, (y_vals, title, color) in enumerate([
+                    (N_vals,  "Axial",  "blue"),
+                    (V2_vals, "Shear",  "blue"),
+                    (M3_vals, "Moment", "red"),
+                ], start=1):
+                    fig.add_trace(
+                        go.Scatter(x=x_vals, y=y_vals, name=title, fill='tozeroy',
+                                   line=dict(color=color)),
+                        row=1, col=col_idx
+                    )
+                fig.update_layout(height=400, showlegend=False, template="plotly_white")
+                fig.update_xaxes(title_text="Position (x)")
+                st.plotly_chart(fig, use_container_width=True)
+
     if fast_btn:
         real_params = {"E": pe_E, "A": pe_A, "I": pe_I, "G": pe_G, "P": pe_P, "w": pe_w}
         try:
-            res_eval = evaluate_real_results(truss_data, real_params,
-                                             symbolic_cache=st.session_state["sym_cache"])
+            res_eval = evaluate_real_results(
+                truss_data, real_params,
+                symbolic_cache=st.session_state["sym_cache"],
+                materials=st.session_state["materials"],
+                sections=st.session_state["sections"],
+                include_self_weight=include_sw,
+            )
             output_area.json(res_eval)
             st.info(f"快速代入完成，耗時 {res_eval['eval_time_ms']} ms（使用快取符號解）。")
         except Exception as e:
@@ -233,8 +424,13 @@ with right_panel:
             # 清除舊快取，強制重新求解
             st.session_state["sym_cache"] = {}
             real_params = {"E": pe_E, "A": pe_A, "I": pe_I, "G": pe_G, "P": pe_P, "w": pe_w}
-            res_eval = evaluate_real_results(truss_data, real_params,
-                                             symbolic_cache=st.session_state["sym_cache"])
+            res_eval = evaluate_real_results(
+                truss_data, real_params,
+                symbolic_cache=st.session_state["sym_cache"],
+                materials=st.session_state["materials"],
+                sections=st.session_state["sections"],
+                include_self_weight=include_sw,
+            )
             res = st.session_state["sym_cache"]["raw_result"]
             output_area.json(res_eval)
         except Exception as e:
