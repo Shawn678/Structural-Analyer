@@ -371,7 +371,11 @@ with right_panel:
                 st.error(f"匯入失敗：{import_result['error']}")
             else:
                 st.session_state["sym_cache"] = import_result
-                st.success("指紋一致，快取已載入，可使用快速代入。")
+                if import_result.get("materials"):
+                    st.session_state["materials"] = import_result["materials"]
+                if import_result.get("sections"):
+                    st.session_state["sections"] = import_result["sections"]
+                st.success("指紋一致，快取已載入，材料與截面定義已還原。")
 
     output_area = st.empty()
     res_eval = None
