@@ -164,3 +164,65 @@ def test_import_cache_enables_fast_eval():
     imported = import_cache_from_txt(txt, BEAM_DATA)
     res = evaluate_real_results(BEAM_DATA, REAL_PARAMS, symbolic_cache=imported)
     assert res["cache_used"] is True
+
+
+# ── Task 3: per-section real_params & self-weight ─────────────────────────
+
+from core.materials import expand_truss_data, compute_self_weight
+
+MATS = [{"name":"鋼材","E":200e9,"G":77e9,"density":7850}]
+SECS = [{"name":"主樑","material":"鋼材","shape":"Custom",
+          "A":0.01,"I33":1e-4,"I22":1e-5,"J":1e-5}]
+BEAM_SEC = {
+    "nodes": [
+        {"id":1,"x":0,"y":0,"z":0},
+        {"id":2,"x":3,"y":0,"z":0},
+        {"id":3,"x":6,"y":0,"z":0},
+    ],
+    "elements": [
+        {"id":1,"i":1,"j":2,"pin_i":True,"pin_j":False,"section":"主樑"},
+        {"id":2,"i":2,"j":3,"pin_i":False,"pin_j":True,"section":"主樑"},
+    ],
+    "supports": [
+        {"node_id":1,"ux":True,"uy":True,"uz":True,"rx":True,"ry":True,"rz":False},
+        {"node_id":3,"ux":False,"uy":True,"uz":True,"rx":True,"ry":True,"rz":False},
+    ],
+    "loads": [{"node_id":2,"fz":-1000.0}],
+    "element_loads": [],
+    "element_point_loads": [],
+}
+
+def test_evaluate_with_materials_sections():
+    res = evaluate_real_results(BEAM_SEC, {}, materials=MATS, sections=SECS)
+    assert "node_displacements" in res
+    assert "support_reactions" in res
+
+def test_self_weight_increases_reaction():
+    res_no_sw  = evaluate_real_results(BEAM_SEC, {}, materials=MATS, sections=SECS,
+                                        include_self_weight=False)
+    res_with_sw = evaluate_real_results(BEAM_SEC, {}, materials=MATS, sections=SECS,
+                                         include_self_weight=True)
+    # 加入自重後，支承 Z 方向反力總和應增加
+    def total_rz(res):
+        return sum(r["Rz"]["value"] for r in res["support_reactions"]
+                   if r.get("Rz",{}).get("value") is not None)
+    # 自重向下（-Z），反力為正 Z，故 total_rz 應變大（更正）
+    assert total_rz(res_with_sw) > total_rz(res_no_sw)
+
+def test_txt_export_contains_materials_sections():
+    cache = {}
+    evaluate_real_results(BEAM_SEC, {}, symbolic_cache=cache, materials=MATS, sections=SECS)
+    txt = export_cache_to_txt(cache)
+    assert "[MATERIALS]" in txt
+    assert "[SECTIONS]" in txt
+    assert "鋼材" in txt
+    assert "主樑" in txt
+
+def test_txt_roundtrip_restores_materials_sections():
+    cache = {}
+    evaluate_real_results(BEAM_SEC, {}, symbolic_cache=cache, materials=MATS, sections=SECS)
+    txt = export_cache_to_txt(cache)
+    imported = import_cache_from_txt(txt, BEAM_SEC)
+    assert "error" not in imported
+    assert imported.get("materials") == MATS
+    assert imported.get("sections")[0]["name"] == "主樑"
