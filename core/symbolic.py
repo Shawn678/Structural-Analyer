@@ -1,3 +1,4 @@
+import copy
 import sympy as sp
 import numpy as np
 import time
@@ -499,7 +500,18 @@ def run_symbolic_analysis(truss_data: dict, section_sym_map: dict | None = None)
         I_s = I_base * scale
         G_s = G_base * scale
 
-        K_s, elems_s, _, free_s = _assemble_K_np(truss_data, E_s, A_s, I_s, G_s)
+        if per_elem_E is not None:
+            # Scale element properties so K_s actually varies with scale
+            td_scaled = copy.deepcopy(truss_data)
+            for k, elem in enumerate(td_scaled['elements']):
+                elem['E']   = per_elem_E[k] * scale
+                elem['A']   = per_elem_A[k] * scale
+                elem['I33'] = per_elem_I[k] * scale
+                elem['I22'] = per_elem_I[k] * scale  # approximate, same as current basis
+                elem['G']   = per_elem_G[k] * scale
+            K_s, elems_s, _, free_s = _assemble_K_np(td_scaled, E_s, A_s, I_s, G_s)
+        else:
+            K_s, elems_s, _, free_s = _assemble_K_np(truss_data, E_s, A_s, I_s, G_s)
         assert set(free_s) == set(free_dofs), f"採樣 {s_idx}: free_dof 集合在縮放下改變，請檢查結構輸入"
         K_red = K_s[np.ix_(free_s, free_s)]
 
@@ -510,11 +522,7 @@ def run_symbolic_analysis(truss_data: dict, section_sym_map: dict | None = None)
         U_w_s = np.linalg.solve(K_red, F_w_s) if has_w_load else np.zeros(len(free_s))
 
         # 展開至全域 DOF
-        U_P_full = np.zeros(total_dof)
-        U_w_full = np.zeros(total_dof)
         for i, d in enumerate(free_s):
-            U_P_full[d] = U_P_s[i]
-            U_w_full[d] = U_w_s[i]
             samples_P_full[s_idx, d] = U_P_s[i]
             samples_w_full[s_idx, d] = U_w_s[i]
 
