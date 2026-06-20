@@ -82,7 +82,8 @@ def expand_truss_data(truss_data: dict, materials: list, sections: list) -> dict
         shape = sec.get("shape", "Custom")
         props = compute_section_props(shape, sec)
 
-        # 逐欄填入，只在 elem 中尚未存在該欄位時才填（保留 override）
+        # 逐欄填入，以數值比較判斷是否為 override。若 elem 中的值與 section 值不同，視為故意 override 保留；
+        # 若相同或不存在，從 section 填入（允許 Streamlit UI 預先註冊所有欄位的情況）
         for key, src_val in [
             ("E",   float(mat.get("E",   0))),
             ("G",   float(mat.get("G",   0))),
@@ -93,6 +94,13 @@ def expand_truss_data(truss_data: dict, materials: list, sections: list) -> dict
         ]:
             if key not in elem:
                 elem[key] = src_val
+            else:
+                current = float(elem[key]) if elem[key] is not None else 0.0
+                # 只有當元素值與 section 值明顯不同時，才視為蓄意 override 並保留
+                if src_val != 0 and abs(current - src_val) > abs(src_val) * 1e-9:
+                    pass  # 蓄意 override — 保留 current
+                else:
+                    elem[key] = src_val  # 無 override — 從 section 填入
     return td
 
 

@@ -89,6 +89,24 @@ def test_expand_does_not_mutate_original():
     expand_truss_data(truss, MATERIALS, SECTIONS)
     assert "E" not in truss["elements"][0]   # 原始資料不應被修改
 
+def test_expand_fills_when_value_matches_section():
+    """UI 預先註冊欄位但與 section 值相同時，應填入（無函義變化，但確認無誤判）"""
+    import copy
+    truss = copy.deepcopy(TRUSS)
+    # Element 有 E 預設為 section 值（UI 預設狀態常見）
+    truss["elements"][0]["E"] = 200e9   # 與 material 的 E 相同
+    truss["elements"][0]["A"] = 0.01    # 與 section A 相同
+    td = expand_truss_data(truss, MATERIALS, SECTIONS)
+    # 這些與 section 相同 — 應填入（無函義變化）
+    assert td["elements"][0]["E"] == 200e9
+    assert td["elements"][0]["A"] == 0.01
+
+    # 測試具體的 override（E 不同）
+    truss2 = copy.deepcopy(TRUSS)
+    truss2["elements"][0]["E"] = 70e9   # 不同 — 蓄意 override
+    td2 = expand_truss_data(truss2, MATERIALS, SECTIONS)
+    assert td2["elements"][0]["E"] == 70e9  # override 保留
+
 # ── compute_self_weight ────────────────────────────────────────────────────
 
 def test_self_weight_value():
