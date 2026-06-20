@@ -1,5 +1,6 @@
 import math
 import copy
+import numpy as np
 
 # ── 截面幾何計算 ───────────────────────────────────────────────────────────
 
@@ -60,7 +61,6 @@ def compute_section_props(shape: str, params: dict) -> dict:
         J   = (1/3) * (2*bf*tf**3 + bw*tw**3)
         return {"A": A, "I33": I33, "I22": I22, "J": J}
     if shape == "箱涵":
-        import numpy as np
         b_top = float(params["b_top"])
         b_bot = float(params["b_bot"])
         h     = float(params["h"])
@@ -69,7 +69,9 @@ def compute_section_props(shape: str, params: dict) -> dict:
         t_web = float(params["t_web"])
         t_dia = float(params["t_dia"])
         n     = int(params["n_cell"])
-        c_top = float(params["c_top"])
+        if not 1 <= n <= 5:
+            raise ValueError(f"箱涵 n_cell 須介於 1～5，收到 {n}")
+        c_top = float(params.get("c_top", 0.0))
 
         hw = h - t_top - t_bot                          # 腹板淨高
         b_box = b_bot - 2 * t_web                       # 底板內淨寬
