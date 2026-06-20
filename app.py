@@ -448,15 +448,69 @@ with left_panel:
 
     st.caption("快速代入：幾何與支承不變時，直接代入新材料/載重參數，無需重新求符號解。")
     with st.expander("⚡ 快速代入參數", expanded=False):
-        col_a, col_b = st.columns(2)
-        with col_a:
-            pe_E = st.number_input("E (Pa)", value=200e9, format="%.3e", key="pe_E")
-            pe_I = st.number_input("I (m⁴)", value=1e-4,  format="%.3e", key="pe_I")
-            pe_P = st.number_input("P 倍率", value=1.0,   key="pe_P")
-        with col_b:
-            pe_A = st.number_input("A (m²)", value=0.01,  format="%.4f", key="pe_A")
-            pe_G = st.number_input("G (Pa)", value=77e9,  format="%.3e", key="pe_G")
-            pe_w = st.number_input("w 倍率", value=0.0,   key="pe_w")
+        # 斷面組清單（依 elements_data 中實際使用的斷面）
+        _qf_sec_names = sorted(set(
+            r.get("section", "") for r in st.session_state.get("elements_data", [])
+            if r.get("section")
+        ))
+        _qf_sec_key = str(_qf_sec_names)
+
+        if ("quickfill_overrides" not in st.session_state
+                or st.session_state.get("quickfill_sec_key") != _qf_sec_key):
+            # 從 sections + materials 取預設值
+            _qf_defaults = {}
+            for sn in _qf_sec_names:
+                sec = sec_map_ui.get(sn, {})
+                mat = mat_map_ui.get(sec.get("material", ""), {})
+                _qf_defaults[sn] = {
+                    "E":   float(mat.get("E",   200e9)),
+                    "A":   float(sec.get("A",   0.01)),
+                    "I33": float(sec.get("I33", 1e-4)),
+                    "G":   float(mat.get("G",   77e9)),
+                }
+            st.session_state["quickfill_overrides"] = _qf_defaults
+            st.session_state["quickfill_sec_key"]   = _qf_sec_key
+
+        if _qf_sec_names:
+            _qf_rows = [
+                {"斷面名稱": sn,
+                 "E (Pa)":   st.session_state["quickfill_overrides"][sn]["E"],
+                 "A (m²)":   st.session_state["quickfill_overrides"][sn]["A"],
+                 "I33 (m⁴)": st.session_state["quickfill_overrides"][sn]["I33"],
+                 "G (Pa)":   st.session_state["quickfill_overrides"][sn]["G"]}
+                for sn in _qf_sec_names
+            ]
+            _qf_df = st.data_editor(
+                pd.DataFrame(_qf_rows),
+                column_config={
+                    "斷面名稱": st.column_config.TextColumn("斷面名稱", disabled=True),
+                    "E (Pa)":   st.column_config.NumberColumn("E (Pa)",   format="%.3e"),
+                    "A (m²)":   st.column_config.NumberColumn("A (m²)",   format="%.4e"),
+                    "I33 (m⁴)": st.column_config.NumberColumn("I33 (m⁴)", format="%.4e"),
+                    "G (Pa)":   st.column_config.NumberColumn("G (Pa)",   format="%.3e"),
+                },
+                num_rows="fixed",
+                key="qf_editor",
+                use_container_width=True,
+            )
+            # 將編輯後的值寫回 quickfill_overrides
+            for _, row in _qf_df.iterrows():
+                sn = row["斷面名稱"]
+                if sn in st.session_state["quickfill_overrides"]:
+                    st.session_state["quickfill_overrides"][sn] = {
+                        "E":   float(row["E (Pa)"]),
+                        "A":   float(row["A (m²)"]),
+                        "I33": float(row["I33 (m⁴)"]),
+                        "G":   float(row["G (Pa)"]),
+                    }
+            if len(_qf_sec_names) > 5:
+                st.warning("超過 5 個斷面組，表格可能較長，請捲動查看。")
+        else:
+            st.info("請先在桿件表格中指派斷面，才能使用快速代入。")
+
+        _qf_col1, _qf_col2 = st.columns(2)
+        pe_P = _qf_col1.number_input("P 倍率", value=1.0, key="pe_P")
+        pe_w = _qf_col2.number_input("w 倍率", value=0.0, key="pe_w")
         st.caption(
             "**位移**：從符號公式直接代入 E/A/I/G/L，結果包含材料依賴性。\n"
             "**內力與反力**：以輸入的 E/A/I/G 重新數值求解（使用快取跳過符號分析），"
@@ -573,7 +627,11 @@ with right_panel:
                 st.plotly_chart(fig, use_container_width=True)
 
     if fast_btn:
-        real_params = {"E": pe_E, "A": pe_A, "I": pe_I, "G": pe_G, "P": pe_P, "w": pe_w}
+        _group_vals = {
+            sn: {"E": v["E"], "A": v["A"], "I": v["I33"], "G": v["G"]}
+            for sn, v in st.session_state.get("quickfill_overrides", {}).items()
+        }
+        real_params = {"groups": _group_vals, "P": pe_P, "w": pe_w}
         try:
             res_eval = evaluate_real_results(
                 truss_data, real_params,
@@ -606,7 +664,11 @@ with right_panel:
                     "G":   sp.Symbol(f"G_s{gi}"),
                 }
 
-            real_params = {"E": pe_E, "A": pe_A, "I": pe_I, "G": pe_G, "P": pe_P, "w": pe_w}
+            _run_group_vals = {
+                sn: {"E": v["E"], "A": v["A"], "I": v["I33"], "G": v["G"]}
+                for sn, v in st.session_state.get("quickfill_overrides", {}).items()
+            }
+            real_params = {"groups": _run_group_vals, "P": pe_P, "w": pe_w}
             res_eval = evaluate_real_results(
                 truss_data, real_params,
                 symbolic_cache=st.session_state["sym_cache"],
