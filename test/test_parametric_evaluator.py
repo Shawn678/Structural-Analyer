@@ -226,3 +226,77 @@ def test_txt_roundtrip_restores_materials_sections():
     assert "error" not in imported
     assert imported.get("materials") == MATS
     assert imported.get("sections")[0]["name"] == "主樑"
+
+
+# ── 多斷面組測試 ──────────────────────────────────────────────────────────
+import sympy as sp
+
+MIXED_SECTION_DATA = {
+    "nodes": [
+        {"id": 1, "x": 0.0, "y": 0.0, "z": 0.0},
+        {"id": 2, "x": 6.0, "y": 0.0, "z": 0.0},
+        {"id": 3, "x": 3.0, "y": 3.0, "z": 0.0},
+    ],
+    "elements": [
+        {"id": 1, "i": 1, "j": 2, "section": "S1", "E": 200e9, "A": 0.01, "I33": 1e-4, "I22": 1e-4, "G": 77e9},
+        {"id": 2, "i": 2, "j": 3, "section": "S2", "E": 200e9, "A": 0.02, "I33": 2e-4, "I22": 2e-4, "G": 77e9},
+    ],
+    "supports": [
+        {"node_id": 1, "ux": True, "uy": True, "uz": True, "rx": True, "ry": True, "rz": True},
+        {"node_id": 3, "ux": False, "uy": True, "uz": True, "rx": False, "ry": False, "rz": False},
+    ],
+    "loads": [{"node_id": 2, "fy": -10000.0}],
+    "element_loads": [],
+    "element_point_loads": [],
+}
+
+SECTION_GROUP_MAP = {
+    "S1": {
+        "E": sp.Symbol("E_s1"), "A": sp.Symbol("A_s1"),
+        "I33": sp.Symbol("I_s1"), "I22": sp.Symbol("I_s1"), "G": sp.Symbol("G_s1"),
+    },
+    "S2": {
+        "E": sp.Symbol("E_s2"), "A": sp.Symbol("A_s2"),
+        "I33": sp.Symbol("I_s2"), "I22": sp.Symbol("I_s2"), "G": sp.Symbol("G_s2"),
+    },
+}
+
+def test_per_section_cache_stores_sym_names():
+    """快取應儲存 section_groups 與 section_sym_names。"""
+    cache = {}
+    evaluate_real_results(
+        MIXED_SECTION_DATA,
+        {"E": 200e9, "A": 0.01, "I": 1e-4, "G": 77e9, "P": 1.0, "w": 0.0},
+        symbolic_cache=cache,
+        section_group_map=SECTION_GROUP_MAP,
+    )
+    assert "section_groups" in cache
+    assert "section_sym_names" in cache
+    assert "S1" in cache["section_sym_names"]
+    assert cache["section_sym_names"]["S1"]["E"] == "E_s1"
+
+def test_per_section_groups_substitution():
+    """groups 格式的 real_params 應正確代入各斷面符號，位移非零。"""
+    cache = {}
+    # 第一次：建立快取（使用 section_group_map）
+    evaluate_real_results(
+        MIXED_SECTION_DATA,
+        {"E": 200e9, "A": 0.01, "I": 1e-4, "G": 77e9, "P": 1.0, "w": 0.0},
+        symbolic_cache=cache,
+        section_group_map=SECTION_GROUP_MAP,
+    )
+    # 第二次：使用 groups 格式快速代入
+    real_params = {
+        "groups": {
+            "S1": {"E": 210e9, "A": 0.012, "I": 1.2e-4, "G": 80e9},
+            "S2": {"E": 200e9, "A": 0.020, "I": 2.0e-4, "G": 77e9},
+        },
+        "P": 1.0,
+        "w": 0.0,
+    }
+    res = evaluate_real_results(MIXED_SECTION_DATA, real_params, symbolic_cache=cache)
+    # node 2 應有非零位移（受力節點，fy 載重 → uy 位移）
+    nd2 = next(n for n in res["node_displacements"] if n["node_id"] == 2)
+    uy_val = nd2["uy"]["value"]
+    assert uy_val is not None
+    assert abs(uy_val) > 1e-10

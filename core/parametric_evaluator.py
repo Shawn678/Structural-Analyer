@@ -48,7 +48,9 @@ def build_geometry_fingerprint(truss_data: dict) -> dict:
 def _subs_value(formula_str: str, subs_dict: dict) -> float | None:
     """將公式字串代入數值，回傳 float；失敗或結果非有限數時回傳 None。"""
     try:
-        expr = sp.sympify(formula_str)
+        # fmt() 將 '*' 轉換為 '·'（U+00B7），sympify 無法解析，需先還原
+        cleaned = formula_str.replace('·', '*').replace('^', '**')
+        expr = sp.sympify(cleaned)
         result = float(expr.subs(subs_dict))
         return result if np.isfinite(result) else None
     except Exception:
@@ -62,6 +64,7 @@ def evaluate_real_results(
     materials: list | None = None,
     sections: list | None = None,
     include_self_weight: bool = False,
+    section_group_map: dict | None = None,
 ) -> dict:
     """
     將實際材料/載重參數代入符號公式，回傳數值結果。
@@ -93,7 +96,7 @@ def evaluate_real_results(
         raw = symbolic_cache["raw_result"]
         elem_Ls = symbolic_cache["elem_Ls"]
     else:
-        raw = run_symbolic_analysis(truss_data)
+        raw = run_symbolic_analysis(truss_data, section_group_map=section_group_map)
         elem_Ls = []
         # 從節點座標重建桿件長度（與 symbolic.py 的 elements_info 順序一致）
         node_pos = {n["id"]: (float(n.get("x",0)), float(n.get("y",0)), float(n.get("z",0)))
@@ -107,6 +110,8 @@ def evaluate_real_results(
             symbolic_cache["elem_Ls"]    = elem_Ls
             symbolic_cache["fingerprint"] = build_geometry_fingerprint(truss_data)
             symbolic_cache["timestamp"]   = datetime.now().strftime("%Y-%m-%dT%H:%M")
+            symbolic_cache["section_groups"]    = raw.get("section_groups", [])
+            symbolic_cache["section_sym_names"] = raw.get("section_sym_names", {})
             if materials:
                 symbolic_cache["materials"] = materials
             if sections:
@@ -117,16 +122,36 @@ def evaluate_real_results(
     P_s, w_s = sp.symbols("P w")
     L_syms = [sp.Symbol(f"L_{k+1}") for k in range(len(elem_Ls))]
 
-    subs_dict = {
-        E_s: float(real_params.get("E", 200e9)),
-        A_s: float(real_params.get("A", 0.01)),
-        I_s: float(real_params.get("I", 1e-4)),
-        G_s: float(real_params.get("G", 77e9)),
-        P_s: float(real_params.get("P", 1.0)),
-        w_s: float(real_params.get("w", 0.0)),
-    }
-    for k, Lk_sym in enumerate(L_syms):
-        subs_dict[Lk_sym] = float(elem_Ls[k])
+    subs_dict = {}
+    if "groups" in real_params and symbolic_cache and symbolic_cache.get("section_sym_names"):
+        # 多斷面組路徑：各組獨立符號
+        sym_names = symbolic_cache["section_sym_names"]
+        for sec_name, vals in real_params["groups"].items():
+            if sec_name not in sym_names:
+                continue
+            for field, sym_str in sym_names[sec_name].items():
+                field_key = "I" if field == "I33" else field  # real_params 用 "I"
+                val = vals.get(field_key, vals.get(field))
+                if val is not None:
+                    subs_dict[sp.Symbol(sym_str)] = float(val)
+        # P / w 仍為全局符號
+        subs_dict[P_s] = float(real_params.get("P", 1.0))
+        subs_dict[w_s] = float(real_params.get("w", 0.0))
+        # L 符號
+        for k, Lk_sym in enumerate(L_syms):
+            subs_dict[Lk_sym] = float(elem_Ls[k])
+    else:
+        # 舊路徑：全局 E/A/I/G
+        subs_dict = {
+            E_s: float(real_params.get("E", 200e9)),
+            A_s: float(real_params.get("A", 0.01)),
+            I_s: float(real_params.get("I", 1e-4)),
+            G_s: float(real_params.get("G", 77e9)),
+            P_s: float(real_params.get("P", 1.0)),
+            w_s: float(real_params.get("w", 0.0)),
+        }
+        for k, Lk_sym in enumerate(L_syms):
+            subs_dict[Lk_sym] = float(elem_Ls[k])
 
     # ── 代入節點位移（用符號公式，保有 E/I/L 代數式）───────────────────
     node_displacements = []
@@ -149,28 +174,54 @@ def evaluate_real_results(
 
     # 複製 truss_data，將載重乘上倍率，並以全局材料參數覆蓋所有桿件
     # 若已提供 materials/sections，桿件材料由 expand_truss_data 填入，不以全局覆蓋
-    td_num = copy.deepcopy(truss_data)
     use_per_elem = bool(materials and sections)
-    for elem in td_num["elements"]:
-        if not use_per_elem:
-            elem["E"]   = _E
-            elem["A"]   = _A
-            elem["I33"] = _I
-            elem["I22"] = _I
-            elem["G"]   = _G
-    for load in td_num["loads"]:
-        for k in ("fx", "fy", "fz", "mx", "my", "mz"):
-            if k in load:
-                load[k] = float(load[k]) * _P
-    if not use_per_elem:
-        # 符號模式：element_loads 的 w 是係數，需乘上倍率
+    use_groups = "groups" in real_params and bool(real_params["groups"])
+    if use_groups:
+        # 依各桿件 section 名稱從 groups 取值，跳過 expand_truss_data
+        td_num = copy.deepcopy(truss_data)
+        group_vals = real_params["groups"]
+        for elem in td_num["elements"]:
+            sn = elem.get("section", "")
+            if sn in group_vals:
+                gv = group_vals[sn]
+                elem["E"]   = float(gv.get("E",   elem.get("E",   200e9)))
+                elem["A"]   = float(gv.get("A",   elem.get("A",   0.01)))
+                elem["I33"] = float(gv.get("I",   elem.get("I33", 1e-4)))
+                elem["I22"] = float(gv.get("I",   elem.get("I22", 1e-4)))
+                elem["G"]   = float(gv.get("G",   elem.get("G",   77e9)))
+        # 套用載重倍率
+        for load in td_num["loads"]:
+            for k in ("fx", "fy", "fz", "mx", "my", "mz"):
+                if k in load:
+                    load[k] = float(load[k]) * _P
         for el in td_num["element_loads"]:
             if "w" in el:
                 el["w"] = float(el["w"]) * _w
-    # 若 use_per_elem，element_loads 已是實際數值（自重），直接使用
-    for el in td_num["element_point_loads"]:
-        if "p" in el:
-            el["p"] = float(el["p"]) * _P
+        for el in td_num["element_point_loads"]:
+            if "p" in el:
+                el["p"] = float(el["p"]) * _P
+    else:
+        td_num = copy.deepcopy(truss_data)
+        for elem in td_num["elements"]:
+            if not use_per_elem:
+                elem["E"]   = _E
+                elem["A"]   = _A
+                elem["I33"] = _I
+                elem["I22"] = _I
+                elem["G"]   = _G
+        for load in td_num["loads"]:
+            for k in ("fx", "fy", "fz", "mx", "my", "mz"):
+                if k in load:
+                    load[k] = float(load[k]) * _P
+        if not use_per_elem:
+            # 符號模式：element_loads 的 w 是係數，需乘上倍率
+            for el in td_num["element_loads"]:
+                if "w" in el:
+                    el["w"] = float(el["w"]) * _w
+        # 若 use_per_elem，element_loads 已是實際數值（自重），直接使用
+        for el in td_num["element_point_loads"]:
+            if "p" in el:
+                el["p"] = float(el["p"]) * _P
 
     num = run_numerical_analysis(td_num)
 
