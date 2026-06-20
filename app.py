@@ -374,7 +374,13 @@ with left_panel:
 
     elements_df_styled = pd.DataFrame(updated_rows)
 
-    st.dataframe(elements_df_styled, use_container_width=True)
+    def _highlight_override(row):
+        return ["background-color: #FFE0B2" if row.get("status") == "【修改】" else "" for _ in row]
+
+    st.dataframe(
+        elements_df_styled.style.apply(_highlight_override, axis=1),
+        use_container_width=True,
+    )
     elements_df = elements_df_styled  # 後續分析使用帶入後的版本
 
     st.subheader("支承 (Supports)")
