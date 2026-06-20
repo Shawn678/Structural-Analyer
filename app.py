@@ -438,10 +438,10 @@ with left_panel:
         cache_valid = (current_fp == st.session_state["sym_cache"].get("fingerprint"))
 
     if cache_valid:
-        _current_sec_groups = sorted(set(
-            r.get("section", "") for r in st.session_state.get("elements_data", [])
-            if r.get("section")
-        ))
+        _current_sec_groups = sorted(
+            s.get("name", "") for s in st.session_state.get("sections", [])
+            if s.get("name")
+        )
         _cached_sec_groups = st.session_state["sym_cache"].get("section_groups", [])
         if _current_sec_groups != _cached_sec_groups:
             cache_valid = False
