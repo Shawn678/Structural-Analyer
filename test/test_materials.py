@@ -108,3 +108,58 @@ def test_self_weight_override_uses_overridden_A():
     sw = compute_self_weight(td_exp, SECTIONS, MATERIALS)
     expected_w = -(7850 * 0.02 * 9.81)
     assert abs(sw[0]["w"] - expected_w) < 0.01
+
+
+# ── Task 2: symbolic per-section ──────────────────────────────────────────
+
+from core.symbolic import run_symbolic_analysis
+import sympy as sp
+
+BEAM_2SEC = {
+    "nodes": [
+        {"id":1,"x":0,"y":0,"z":0},
+        {"id":2,"x":3,"y":0,"z":0},
+        {"id":3,"x":6,"y":0,"z":0},
+    ],
+    "elements": [
+        {"id":1,"i":1,"j":2,"E":200e9,"G":77e9,"A":0.01,"I33":1e-4,"I22":1e-5,"J":1e-5,
+         "pin_i":False,"pin_j":False,"beta":0,"dL":0,"section":"主樑"},
+        {"id":2,"i":2,"j":3,"E":100e9,"G":40e9,"A":0.005,"I33":5e-5,"I22":5e-6,"J":5e-6,
+         "pin_i":False,"pin_j":False,"beta":0,"dL":0,"section":"斜柱"},
+    ],
+    "supports": [
+        {"node_id":1,"ux":True,"uy":True,"uz":True,"rx":True,"ry":True,"rz":True},
+        {"node_id":3,"ux":False,"uy":True,"uz":True,"rx":True,"ry":True,"rz":False},
+    ],
+    "loads": [{"node_id":2,"fy":-1000.0}],
+    "element_loads": [],
+    "element_point_loads": [],
+}
+
+E_s0, A_s0, I33_s0 = sp.symbols("E_s0 A_s0 I33_s0", positive=True)
+E_s1, A_s1, I33_s1 = sp.symbols("E_s1 A_s1 I33_s1", positive=True)
+
+SECTION_SYM_MAP = {
+    1: {"E": E_s0, "G": sp.Symbol("G_s0",positive=True),
+        "A": A_s0, "I33": I33_s0,
+        "I22": sp.Symbol("I22_s0",positive=True), "J": sp.Symbol("J_s0",positive=True)},
+    2: {"E": E_s1, "G": sp.Symbol("G_s1",positive=True),
+        "A": A_s1, "I33": I33_s1,
+        "I22": sp.Symbol("I22_s1",positive=True), "J": sp.Symbol("J_s1",positive=True)},
+}
+
+def test_symbolic_per_section_formula_contains_both_symbols():
+    raw = run_symbolic_analysis(BEAM_2SEC, section_sym_map=SECTION_SYM_MAP)
+    # 至少一個節點位移公式應包含兩個 section 的符號（結構在 XY 平面，uy/ux/rz 為主要自由度）
+    all_formulas = " ".join(
+        nd.get("ux","0") + nd.get("uy","0") + nd.get("theta_z","0")
+        for nd in raw["node_displacements"]
+    )
+    assert "E_s0" in all_formulas or "A_s0" in all_formulas or "I33_s0" in all_formulas
+    assert "E_s1" in all_formulas or "A_s1" in all_formulas or "I33_s1" in all_formulas
+
+def test_symbolic_no_section_sym_map_still_works():
+    # 不傳 section_sym_map 時，行為與原來相同（全域 E/A/I/G 符號）
+    raw = run_symbolic_analysis(BEAM_2SEC)
+    assert "node_displacements" in raw
+    assert len(raw["node_displacements"]) == 3
