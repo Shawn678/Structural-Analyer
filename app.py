@@ -264,13 +264,14 @@ with left_panel:
 
     st.subheader("節點 (Nodes)")
     st.caption("座標單位：**m（公尺）**")
+    _nodes_default = st.session_state.pop("_loaded_nodes", None) or [
+        {"id": 1, "x": 0.0, "y": 0.0, "z": 4.0},
+        {"id": 2, "x": 6.0, "y": 0.0, "z": 4.0},
+        {"id": 3, "x": 12.0, "y": 0.0, "z": 4.0},
+        {"id": 4, "x": 0.0, "y": 0.0, "z": 0.0},
+    ]
     nodes_df = st.data_editor(
-        pd.DataFrame([
-            {"id": 1, "x": 0.0, "y": 0.0, "z": 4.0}, # 梁左端
-            {"id": 2, "x": 6.0, "y": 0.0, "z": 4.0}, # 梁中點
-            {"id": 3, "x": 12.0, "y": 0.0, "z": 4.0}, # 梁右端
-            {"id": 4, "x": 0.0, "y": 0.0, "z": 0.0}, # 柱底
-        ]), num_rows="dynamic", key="nodes"
+        pd.DataFrame(_nodes_default), num_rows="dynamic", key="nodes"
     )
 
     st.subheader("桿件 (Elements)")
@@ -390,37 +391,40 @@ with left_panel:
         "- **rx, ry, rz**: 限制繞著 X, Y, Z 軸的轉動 (Rotation)。\n"
         "- **彈簧剛度**: 若要使用 kx/ky/kt (扭轉剛度)，請取消勾選對應的位移/轉動約束。"
     )
+    _supports_default = st.session_state.pop("_loaded_supports", None) or [
+        {"node_id": 4, "ux": True, "uy": True, "uz": True, "rx": True, "ry": True, "rz": True},
+        {"node_id": 2, "ux": False, "uy": True, "uz": True, "rx": True, "ry": False, "rz": True},
+        {"node_id": 3, "ux": False, "uy": True, "uz": True, "rx": True, "ry": False, "rz": True},
+    ]
     supports_df = st.data_editor(
-        pd.DataFrame([
-            # SAP2000 XZ 平面：彎矩釋放應在 ry。固定柱底 (node 4)
-            {"node_id": 4, "ux": True, "uy": True, "uz": True, "rx": True, "ry": True, "rz": True},
-            {"node_id": 2, "ux": False, "uy": True, "uz": True, "rx": True, "ry": False, "rz": True},
-            {"node_id": 3, "ux": False, "uy": True, "uz": True, "rx": True, "ry": False, "rz": True}
-        ]), num_rows="dynamic", key="supports"
+        pd.DataFrame(_supports_default), num_rows="dynamic", key="supports"
     )
 
     st.subheader("載重 (Loads)")
     st.caption("fx / fy / fz：**N（牛頓）**；mx / my / mz：**N·m（牛頓·公尺）**")
+    _loads_default = st.session_state.pop("_loaded_loads", None) or [
+        {"node_id": 2, "fx": 0.0, "fy": 0.0, "fz": -10.0}
+    ]
     loads_df = st.data_editor(
-        pd.DataFrame([
-            {"node_id": 2, "fx": 0.0, "fy": 0.0, "fz": -10.0}
-        ]), num_rows="dynamic", key="loads"
+        pd.DataFrame(_loads_default), num_rows="dynamic", key="loads"
     )
 
     st.subheader("桿件載重 (Element Loads)")
     st.caption("w：均佈載重，單位 **N/m**，向下為負（與 Z 軸正方向相反）")
+    _eloads_default = st.session_state.pop("_loaded_element_loads", None) or [
+        {"element_id": 1, "w": -5.0}
+    ]
     e_loads_df = st.data_editor(
-        pd.DataFrame([
-            {"element_id": 1, "w": -5.0}
-        ]), num_rows="dynamic", key="element_loads"
+        pd.DataFrame(_eloads_default), num_rows="dynamic", key="element_loads"
     )
 
     st.subheader("桿件集中載重 (Element Point Loads)")
     st.caption("p：集中力 **N**；a：距 i 端距離 **m**")
+    _eptloads_default = st.session_state.pop("_loaded_element_point_loads", None) or [
+        {"element_id": 1, "p": 0.0, "a": 0.0}
+    ]
     e_pt_loads_df = st.data_editor(
-        pd.DataFrame([
-            {"element_id": 1, "p": 0.0, "a": 0.0}
-        ]), num_rows="dynamic", key="element_point_loads"
+        pd.DataFrame(_eptloads_default), num_rows="dynamic", key="element_point_loads"
     )
 
     include_sw = st.checkbox("含自重（Self-Weight）", value=False, key="include_sw")
@@ -624,6 +628,62 @@ truss_data = {
 
 with right_panel:
     st.subheader("分析結果輸出")
+
+    # ── 存檔 / 載入 ──────────────────────────────────────────────────────
+    with st.expander("💾 存檔 / 載入", expanded=False):
+        import json as _json_save
+
+        # 存檔
+        _save_data = {
+            "version": 1,
+            "materials":            st.session_state.get("materials", []),
+            "sections":             st.session_state.get("sections", []),
+            "elements_data":        st.session_state.get("elements_data", []),
+            "nodes":                truss_data["nodes"],
+            "supports":             truss_data["supports"],
+            "loads":                truss_data["loads"],
+            "element_loads":        truss_data["element_loads"],
+            "element_point_loads":  truss_data["element_point_loads"],
+        }
+        st.download_button(
+            label="💾 存檔（JSON）",
+            data=_json_save.dumps(_save_data, ensure_ascii=False, indent=2).encode("utf-8"),
+            file_name="truss_project.json",
+            mime="application/json",
+            use_container_width=True,
+        )
+
+        st.divider()
+
+        # 載入
+        _load_file = st.file_uploader("載入存檔（JSON）", type=["json"], key="project_upload")
+        if _load_file is not None:
+            try:
+                _loaded = _json_save.loads(_load_file.read().decode("utf-8"))
+                if _loaded.get("version") != 1:
+                    st.error("不支援的存檔版本，請確認檔案正確。")
+                else:
+                    st.session_state["materials"]           = _loaded.get("materials", [])
+                    st.session_state["sections"]            = _loaded.get("sections", [])
+                    st.session_state["elements_data"]       = _loaded.get("elements_data", [])
+                    st.session_state["elem_prev_section"]   = {}
+                    st.session_state["sym_cache"]           = {}
+                    st.session_state.pop("quickfill_overrides", None)
+                    st.session_state.pop("quickfill_sec_key", None)
+                    # 清除 data_editor 快取，強制從 session_state 重新載入
+                    for _k in ("nodes", "elements", "supports", "loads",
+                               "element_loads", "element_point_loads"):
+                        st.session_state.pop(_k, None)
+                    # 將節點、支承、載重寫入 session_state 供下次 render 使用
+                    st.session_state["_loaded_nodes"]               = _loaded.get("nodes", [])
+                    st.session_state["_loaded_supports"]            = _loaded.get("supports", [])
+                    st.session_state["_loaded_loads"]               = _loaded.get("loads", [])
+                    st.session_state["_loaded_element_loads"]       = _loaded.get("element_loads", [])
+                    st.session_state["_loaded_element_point_loads"] = _loaded.get("element_point_loads", [])
+                    st.success("存檔已載入，代數解快取已清除，請重新執行分析。")
+                    st.rerun()
+            except Exception as _ex:
+                st.error(f"載入失敗：{_ex}")
 
     # ── 快取狀態顯示 ─────────────────────────────────────────────────────
     with st.expander("代數解快取管理", expanded=False):
