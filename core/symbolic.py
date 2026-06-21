@@ -2,6 +2,7 @@ import copy
 import sympy as sp
 import numpy as np
 import time
+from core.rigid_link import apply_rigid_links, recover_slave_displacements
 
 def _to_sym(val, default=0):
     """安全地將輸入轉換為 SymPy 數值，處理 None, NaN 或空字串。"""
@@ -368,7 +369,22 @@ def run_symbolic_analysis(truss_data: dict, section_group_map: dict | None = Non
     K_base, elements_info, nodes_coords, free_dofs = _assemble_K_np(
         truss_data, E_base, A_base, I_base, G_base
     )
-    fixed_dofs_list = sorted(set(range(total_dof)) - set(free_dofs))
+
+    # ── Rigid Link 前處理 ─────────────────────────────────────────────────
+    rigid_links = truss_data.get('rigid_links', [])
+    slave_node_ids = {str(rl['slave']) for rl in rigid_links}
+    slave_node_idxs = {node_id_to_idx[sid] for sid in slave_node_ids if sid in node_id_to_idx}
+    slave_dofs_set = {idx * NDOF + k for idx in slave_node_idxs for k in range(NDOF)}
+
+    # free_dofs 排除 slave DOF（slave DOF 由 rigid link 凝縮決定）
+    free_dofs = [d for d in free_dofs if d not in slave_dofs_set]
+
+    # master_dofs：全域所有 DOF 中排除 slave DOF（含 fixed DOF，供凝縮矩陣索引用）
+    all_dofs_no_slave = [d for d in range(total_dof) if d not in slave_dofs_set]
+    # 凝縮後 DOF 在 all_dofs_no_slave 中的位置 → 用於從 K_cond 切出 free submatrix
+    master_free_cols = [all_dofs_no_slave.index(d) for d in free_dofs]
+
+    fixed_dofs_list = sorted(set(range(total_dof)) - set(free_dofs) - slave_dofs_set)
 
     # 符號 L_syms（依 elements_info 順序）
     elem_Ls  = [info['Le'] for info in elements_info]
@@ -555,6 +571,13 @@ def run_symbolic_analysis(truss_data: dict, section_group_map: dict | None = Non
     samples_w_full = np.zeros((n_samples, total_dof))
     basis_P_rows   = np.zeros((n_samples, n_elem * 5))
     basis_w_rows   = np.zeros((n_samples, n_elem * 2))
+    # 反力採樣（indexed by fixed_dofs_list 位置）
+    _n_fixed = len(fixed_dofs_list)
+    samples_react_P = np.zeros((n_samples, _n_fixed))
+    samples_react_w = np.zeros((n_samples, _n_fixed))
+    # 桿件端力採樣（每根桿件 12 個端力分量）
+    samples_ef_P = np.zeros((n_samples, n_elem * 12))
+    samples_ef_w = np.zeros((n_samples, n_elem * 12))
 
     print(f"-> [Step 2/4] 開始 {n_samples} 組採樣（{'Hadamard 交叉' if _n_groups > 0 else '全域均勻'}模式）...")
     for s_idx in range(n_samples):
@@ -615,19 +638,64 @@ def run_symbolic_analysis(truss_data: dict, section_group_map: dict | None = Non
             else:
                 K_s, elems_s, _, free_s = _assemble_K_np(truss_data, E_s, A_s, I_s, G_s)
 
-        assert set(free_s) == set(free_dofs), f"採樣 {s_idx}: free_dof 集合在縮放下改變，請檢查結構輸入"
-        K_red = K_s[np.ix_(free_s, free_s)]
+        # free_s（來自 _assemble_K_np）含 slave DOF，需排除後才能與凝縮矩陣對齊
+        free_s_no_slave = [d for d in free_s if d not in slave_dofs_set]
+        assert set(free_s_no_slave) == set(free_dofs), \
+            f"採樣 {s_idx}: free_dof 集合在縮放下改變，請檢查結構輸入"
+
+        # 若有 rigid link，先凝縮 K_s；否則直接切 submatrix
+        if rigid_links:
+            F_zero_s = np.zeros(total_dof)
+            K_cond_s, _, _ = apply_rigid_links(K_s, F_zero_s, node_list, rigid_links)
+            K_red = K_cond_s[np.ix_(master_free_cols, master_free_cols)]
+        else:
+            K_red = K_s[np.ix_(free_s_no_slave, free_s_no_slave)]
 
         F_P_s = F_P_np_free
         F_w_s = F_w_np_free
 
-        U_P_s = np.linalg.solve(K_red, F_P_s) if has_P_load else np.zeros(len(free_s))
-        U_w_s = np.linalg.solve(K_red, F_w_s) if has_w_load else np.zeros(len(free_s))
+        U_P_s = np.linalg.solve(K_red, F_P_s) if has_P_load else np.zeros(len(free_dofs))
+        U_w_s = np.linalg.solve(K_red, F_w_s) if has_w_load else np.zeros(len(free_dofs))
 
-        # 展開至全域 DOF
-        for i, d in enumerate(free_s):
+        # 展開至全域 DOF（slave DOF 位置保留為 0；後續反推）
+        U_P_full_s = np.zeros(total_dof)
+        U_w_full_s = np.zeros(total_dof)
+        for i, d in enumerate(free_dofs):
             samples_P_full[s_idx, d] = U_P_s[i]
             samples_w_full[s_idx, d] = U_w_s[i]
+            U_P_full_s[d] = U_P_s[i]
+            U_w_full_s[d] = U_w_s[i]
+
+        # 採樣反力 R = K_fx_fr @ U_free - F_fixed
+        if _n_fixed > 0:
+            K_fx_fr_s = K_s[np.ix_(fixed_dofs_list, free_dofs)]
+            F_P_fixed = np.array([float(F_P_sym[d, 0].subs(P_sym, 1)) for d in fixed_dofs_list])
+            F_w_fixed = np.array([float(F_w_sym[d, 0].subs(w_sym, 1)) for d in fixed_dofs_list])
+            samples_react_P[s_idx] = K_fx_fr_s @ U_P_s - F_P_fixed
+            samples_react_w[s_idx] = K_fx_fr_s @ U_w_s - F_w_fixed
+
+        # 採樣桿件端力（使用當次採樣的 elements_info）
+        _elems_for_ef = elems_s if (_n_groups > 0 or per_elem_E is not None) else elements_info
+        for k_idx, info_s in enumerate(_elems_for_ef):
+            ni_s, nj_s = info_s['nodes']
+            dofs_s = _elem_dofs(ni_s, nj_s, NDOF)
+            f_fix_s = info_s.get('f_fixed_local_sum')
+            fix_P_s = np.zeros(12)
+            fix_w_s = np.zeros(12)
+            if f_fix_s is not None:
+                for kk in range(12):
+                    fk = f_fix_s[kk, 0]
+                    if fk != sp.S.Zero:
+                        fix_P_s[kk] = float(fk.subs(P_sym, 1).subs(w_sym, 0))
+                        fix_w_s[kk] = float(fk.subs(w_sym, 1).subs(P_sym, 0))
+            T_s  = info_s['T_np']
+            kl_s = info_s['kl_np']
+            f_P_s = kl_s @ (T_s @ U_P_full_s[dofs_s]) + fix_P_s
+            f_w_s = kl_s @ (T_s @ U_w_full_s[dofs_s]) + fix_w_s
+            SIGN = [1, 1, 1, 1, 1, -1, 1, -1, -1, 1, 1, -1]
+            for kk in range(12):
+                samples_ef_P[s_idx, k_idx * 12 + kk] = SIGN[kk] * f_P_s[kk]
+                samples_ef_w[s_idx, k_idx * 12 + kk] = SIGN[kk] * f_w_s[kk]
 
         if _n_groups > 0:
             # Hadamard 模式：basis 使用各桿件的獨立縮放後材料參數
@@ -667,6 +735,29 @@ def run_symbolic_analysis(truss_data: dict, section_group_map: dict | None = Non
 
     print(f"-> [Step 2/4] 採樣完成。耗時: {time.time()-start_time:.2f}s")
 
+    # ── Slave 節點位移（用 base 材料數值解反推）────────────────────────────
+    slave_displacements = {}
+    if rigid_links:
+        F_base_full = np.array([float(F_P_sym[d, 0].subs(P_sym, 1)) +
+                                float(F_w_sym[d, 0].subs(w_sym, 1))
+                                for d in range(total_dof)], dtype=float)
+        K_cond_base, F_cond_base, _ = apply_rigid_links(
+            K_base, F_base_full, node_list, rigid_links)
+        F_free_base = F_cond_base[master_free_cols]
+        K_free_base = K_cond_base[np.ix_(master_free_cols, master_free_cols)]
+        if has_P_load or has_w_load:
+            try:
+                U_free_base = np.linalg.solve(K_free_base, F_free_base)
+            except np.linalg.LinAlgError:
+                U_free_base = np.zeros(len(master_free_cols))
+        else:
+            U_free_base = np.zeros(len(master_free_cols))
+        U_full_base = np.zeros(total_dof)
+        for i, d in enumerate(free_dofs):
+            U_full_base[d] = U_free_base[i]
+        slave_disps = recover_slave_displacements(U_full_base, node_list, rigid_links)
+        slave_displacements = {k: v.tolist() for k, v in slave_disps.items()}
+
     # ── 擬合與符號組裝 ────────────────────────────────────────────────────
     print("-> [Step 3/4] 擬合符號表達式...")
     any_invalid = False
@@ -701,85 +792,82 @@ def run_symbolic_analysis(truss_data: dict, section_group_map: dict | None = Non
             "theta_z": fmt(dof_sym_exprs[NDOF*idx+5]),
         })
 
-    # ── 桿件內力（基準採樣數值解，係數×P/w）────────────────────────────────
-    # 內力對 E/I 的依賴由 evaluate_real_results 的數值求解層補足，
-    # 此處輸出基準係數公式供展示用。
-    K_red_base = K_base[np.ix_(free_dofs, free_dofs)]
-    U_P_base = np.linalg.solve(K_red_base, F_P_np) if has_P_load else np.zeros(len(free_dofs))
-    U_w_base = np.linalg.solve(K_red_base, F_w_np) if has_w_load else np.zeros(len(free_dofs))
-    coeff_P = np.zeros(total_dof)
-    coeff_w = np.zeros(total_dof)
-    for i, d in enumerate(free_dofs):
-        coeff_P[d] = U_P_base[i]
-        coeff_w[d] = U_w_base[i]
+    # ── 反力與桿件端力：用多點採樣擬合，基底為 L^1/L^0（純力，不含 E/I）──────
+    # 力的量綱：P 載重 → 係數 * P；w 載重 → 係數 * w * L_k
+    # 基底：[L_1, L_2, ..., L_n, 1]（涵蓋 w·L 和 P 的常數項）
+    def _build_force_basis_row(elem_Ls_val):
+        """力的基底列：[L_1, L_2, ..., L_n, 1]，對 P 與 w 共用。"""
+        row = list(elem_Ls_val) + [1.0]
+        return np.array(row, dtype=np.float64)
 
+    def _build_force_sym_bases(L_syms_list):
+        return list(L_syms_list) + [sp.S.One]
+
+    force_basis_rows = np.array([_build_force_basis_row(elem_Ls) for _ in range(n_samples)])
+    force_sym_bases  = _build_force_sym_bases(L_syms)
+
+    def _fit_force(b_col):
+        """用力基底擬合單一分量，回傳係數與殘差。"""
+        if np.all(np.abs(b_col) < 1e-40):
+            return np.zeros(force_basis_rows.shape[1]), 0.0
+        c, _, _, _ = np.linalg.lstsq(force_basis_rows, b_col, rcond=None)
+        c = c.copy()
+        pred = force_basis_rows @ c
+        rel_err = np.max(np.abs(pred - b_col)) / (np.max(np.abs(b_col)) + 1e-40)
+        return c, rel_err
+
+    def _make_force_expr(c_P, c_w, tol_scale=1e-6):
+        """將擬合係數組裝為 SymPy 表達式 c_P*P + c_w*w。"""
+        tol_P = tol_scale * (np.max(np.abs(c_P)) if np.any(c_P) else 1.0)
+        tol_w = tol_scale * (np.max(np.abs(c_w)) if np.any(c_w) else 1.0)
+        terms = []
+        for j, (cp, cw) in enumerate(zip(c_P, c_w)):
+            base = force_sym_bases[j]
+            if abs(cp) > tol_P:
+                terms.append(sp.nsimplify(float(cp), tolerance=1e-6, rational=True) * base * P_sym)
+            if abs(cw) > tol_w:
+                terms.append(sp.nsimplify(float(cw), tolerance=1e-6, rational=True) * base * w_sym)
+        return sp.Add(*terms) if terms else sp.S.Zero
+
+    # 擬合桿件端力
     element_forces = []
     for k_idx, info in enumerate(elements_info):
         ni, nj = info['nodes']
-        dofs   = _elem_dofs(ni, nj, NDOF)
-        u_P    = coeff_P[dofs]
-        u_w    = coeff_w[dofs]
-        T_e    = info['T_np']
-        kl_e   = info['kl_np']
-        f_P    = kl_e @ (T_e @ u_P)
-        f_w    = kl_e @ (T_e @ u_w)
-        f_fix  = info['f_fixed_local_sum']
-
-        def _fi_sym(k):
-            if f_fix is None:
-                fix_P, fix_w = 0.0, 0.0
-            else:
-                fix_k = f_fix[k, 0]
-                fix_P = float(fix_k.subs(P_sym, 1).subs(w_sym, 0)) if fix_k != sp.S.Zero else 0.0
-                fix_w = float(fix_k.subs(w_sym, 1).subs(P_sym, 0)) if fix_k != sp.S.Zero else 0.0
-            cp = f_P[k] + fix_P
-            cw = f_w[k] + fix_w
-            terms = []
-            if abs(cp) > 1e-20:
-                terms.append(sp.nsimplify(cp, tolerance=1e-6, rational=True) * P_sym)
-            if abs(cw) > 1e-20:
-                terms.append(sp.nsimplify(cw, tolerance=1e-6, rational=True) * w_sym)
-            return sp.Add(*terms) if terms else sp.S.Zero
-
-        fi_fem = [_fi_sym(k) for k in range(12)]
-        SIGN = [1, 1, 1, 1, 1, -1, 1, -1, -1, 1, 1, -1]
-        fi = [SIGN[k] * fi_fem[k] for k in range(12)]
+        fi_exprs = []
+        for kk in range(12):
+            col_P = samples_ef_P[:, k_idx * 12 + kk]
+            col_w = samples_ef_w[:, k_idx * 12 + kk]
+            c_P, _ = _fit_force(col_P)
+            c_w, _ = _fit_force(col_w)
+            fi_exprs.append(_make_force_expr(c_P, c_w))
 
         element_forces.append({
             "element_id": info["id"],
             "nodes": f"N{idx_to_node_id[ni]} - N{idx_to_node_id[nj]}",
             "i_end (N, V2, V3, T, M2, M3)": (
-                f"({fmt(fi[0])}, {fmt(fi[1])}, {fmt(fi[2])}, "
-                f"{fmt(fi[3])}, {fmt(fi[4])}, {fmt(fi[5])})"
+                f"({fmt(fi_exprs[0])}, {fmt(fi_exprs[1])}, {fmt(fi_exprs[2])}, "
+                f"{fmt(fi_exprs[3])}, {fmt(fi_exprs[4])}, {fmt(fi_exprs[5])})"
             ),
             "j_end (N, V2, V3, T, M2, M3)": (
-                f"({fmt(fi[6])}, {fmt(fi[7])}, {fmt(fi[8])}, "
-                f"{fmt(fi[9])}, {fmt(fi[10])}, {fmt(fi[11])})"
+                f"({fmt(fi_exprs[6])}, {fmt(fi_exprs[7])}, {fmt(fi_exprs[8])}, "
+                f"{fmt(fi_exprs[9])}, {fmt(fi_exprs[10])}, {fmt(fi_exprs[11])})"
             ),
             "equations": {
-                "N(x)":  fmt(fi[0]),
-                "V2(x)": fmt(fi[1]),
-                "V3(x)": fmt(fi[2]),
-                "M3(x)": fmt(fi[5]),
-                "M2(x)": fmt(fi[4]),
+                "N(x)":  fmt(fi_exprs[0]),
+                "V2(x)": fmt(fi_exprs[1]),
+                "V3(x)": fmt(fi_exprs[2]),
+                "M3(x)": fmt(fi_exprs[5]),
+                "M2(x)": fmt(fi_exprs[4]),
             },
             "status": "受力桿件"
         })
 
-    # ── 支承反力（基準採樣，係數×P/w）───────────────────────────────────
+    # 擬合支承反力
     Reactions_full = sp.zeros(total_dof, 1)
-    if fixed_dofs_list:
-        K_fx_fr = K_base[np.ix_(fixed_dofs_list, free_dofs)]
-        R_P = K_fx_fr @ U_P_base - np.array([float(F_P_sym[d, 0].subs(P_sym, 1)) for d in fixed_dofs_list])
-        R_w = K_fx_fr @ U_w_base - np.array([float(F_w_sym[d, 0].subs(w_sym, 1)) for d in fixed_dofs_list])
-        for ii, dof_idx in enumerate(fixed_dofs_list):
-            cp, cw = R_P[ii], R_w[ii]
-            terms = []
-            if abs(cp) > 1e-20:
-                terms.append(sp.nsimplify(cp, tolerance=1e-6, rational=True) * P_sym)
-            if abs(cw) > 1e-20:
-                terms.append(sp.nsimplify(cw, tolerance=1e-6, rational=True) * w_sym)
-            Reactions_full[dof_idx, 0] = sp.Add(*terms) if terms else sp.S.Zero
+    for ii, dof_idx in enumerate(fixed_dofs_list):
+        c_P, _ = _fit_force(samples_react_P[:, ii])
+        c_w, _ = _fit_force(samples_react_w[:, ii])
+        Reactions_full[dof_idx, 0] = _make_force_expr(c_P, c_w)
 
     support_reactions = []
     for sup in truss_data['supports']:
@@ -809,11 +897,12 @@ def run_symbolic_analysis(truss_data: dict, section_group_map: dict | None = Non
             _sec_sym_names[sn] = {k: str(v) for k, v in syms.items()}
 
     result = {
-        "node_displacements": node_displacements,
-        "element_forces":     element_forces,
-        "support_reactions":  support_reactions,
-        "section_groups":     _sec_groups,
-        "section_sym_names":  _sec_sym_names,
+        "node_displacements":   node_displacements,
+        "element_forces":       element_forces,
+        "support_reactions":    support_reactions,
+        "section_groups":       _sec_groups,
+        "section_sym_names":    _sec_sym_names,
+        "slave_displacements":  slave_displacements,
     }
     if any_invalid:
         result["warning"] = "部分DOF擬合殘差超過閾值，符號公式可能不精確，建議檢查結構是否含相同長度桿件。"
