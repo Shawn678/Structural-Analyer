@@ -28,6 +28,8 @@ st.set_page_config(page_title="Structural Analysis", layout="wide")
 
 if "sym_cache" not in st.session_state:
     st.session_state["sym_cache"] = {}
+if "rigid_links" not in st.session_state:
+    st.session_state["rigid_links"] = []
 if "materials" not in st.session_state:
     st.session_state["materials"] = [
         {"name": "鋼材",   "E": 200e9, "G": 77e9, "density": 7850.0},
@@ -264,15 +266,20 @@ with left_panel:
 
     st.subheader("節點 (Nodes)")
     st.caption("座標單位：**m（公尺）**")
-    _nodes_default = st.session_state.pop("_loaded_nodes", None) or [
-        {"id": 1, "x": 0.0, "y": 0.0, "z": 4.0},
-        {"id": 2, "x": 6.0, "y": 0.0, "z": 4.0},
-        {"id": 3, "x": 12.0, "y": 0.0, "z": 4.0},
-        {"id": 4, "x": 0.0, "y": 0.0, "z": 0.0},
-    ]
+    _loaded_nodes = st.session_state.pop("_loaded_nodes", None)
+    if _loaded_nodes is not None:
+        st.session_state["nodes_data"] = _loaded_nodes
+    if "nodes_data" not in st.session_state:
+        st.session_state["nodes_data"] = [
+            {"id": 1, "x": 0.0, "y": 0.0, "z": 4.0},
+            {"id": 2, "x": 6.0, "y": 0.0, "z": 4.0},
+            {"id": 3, "x": 12.0, "y": 0.0, "z": 4.0},
+            {"id": 4, "x": 0.0, "y": 0.0, "z": 0.0},
+        ]
     nodes_df = st.data_editor(
-        pd.DataFrame(_nodes_default), num_rows="dynamic", key="nodes"
+        pd.DataFrame(st.session_state["nodes_data"]), num_rows="dynamic", key="nodes"
     )
+    st.session_state["nodes_data"] = nodes_df.dropna(subset=["id"]).to_dict("records")
 
     st.subheader("桿件 (Elements)")
     st.caption(
@@ -426,6 +433,117 @@ with left_panel:
     e_pt_loads_df = st.data_editor(
         pd.DataFrame(_eptloads_default), num_rows="dynamic", key="element_point_loads"
     )
+
+    # ── Rigid Link 表格 ───────────────────────────────────────────────────
+    with st.expander("剛性連桿 Rigid Links", expanded=False):
+        _rl_list = st.session_state.get("rigid_links", [])
+        rl_df_raw = pd.DataFrame(_rl_list) if _rl_list else pd.DataFrame(
+            columns=["id", "master", "slave", "group"])
+
+        _node_pos = {str(n.get("id")): n for n in nodes_df.dropna(subset=["id"]).to_dict("records")}
+
+        def _ecc_str(row):
+            m = _node_pos.get(str(row.get("master", "")), {})
+            s = _node_pos.get(str(row.get("slave",  "")), {})
+            if not m or not s:
+                return ""
+            dx = float(s.get("x", 0)) - float(m.get("x", 0))
+            dy = float(s.get("y", 0)) - float(m.get("y", 0))
+            dz = float(s.get("z", 0)) - float(m.get("z", 0))
+            return f"({dx:.3f}, {dy:.3f}, {dz:.3f})"
+
+        rl_df_raw["偏心向量(m)"] = rl_df_raw.apply(_ecc_str, axis=1) if not rl_df_raw.empty else ""
+        rl_df = st.data_editor(
+            rl_df_raw,
+            column_config={
+                "id":          st.column_config.TextColumn("ID",       width="small"),
+                "master":      st.column_config.TextColumn("Master 節點"),
+                "slave":       st.column_config.TextColumn("Slave 節點"),
+                "group":       st.column_config.TextColumn("群組",     width="small"),
+                "偏心向量(m)": st.column_config.TextColumn("偏心向量", disabled=True),
+            },
+            num_rows="dynamic", key="rl_editor",
+        )
+        st.session_state["rigid_links"] = (
+            rl_df.drop(columns=["偏心向量(m)"], errors="ignore")
+                 .dropna(subset=["master", "slave"])
+                 .to_dict("records")
+        )
+        _existing_grps = sorted({
+            rl.get("group", "") for rl in st.session_state["rigid_links"]
+            if rl.get("group", "")
+        })
+        if _existing_grps:
+            _del_grp = st.selectbox("刪除整組", options=[""] + _existing_grps, key="rl_del_grp")
+            if st.button("刪除群組", key="rl_del_btn") and _del_grp:
+                st.session_state["rigid_links"] = [
+                    rl for rl in st.session_state["rigid_links"] if rl.get("group") != _del_grp]
+                st.session_state["nodes_data"] = [
+                    n for n in st.session_state.get("nodes_data", []) if n.get("group") != _del_grp]
+                st.session_state["elements_data"] = [
+                    e for e in st.session_state["elements_data"] if e.get("group") != _del_grp]
+                for _k in ("nodes", "elements", "rl_editor"):
+                    st.session_state.pop(_k, None)
+                st.rerun()
+
+    # ── 索面精靈 ──────────────────────────────────────────────────────────
+    with st.expander("索面精靈 Cable Face Wizard", expanded=False):
+        from core.cable_wizard import generate_cable_face
+        st.caption("填寫索面參數，自動生成主梁中心節點、偏心錨點、Rigid Link 與索構件。")
+        _wiz_c1, _wiz_c2 = st.columns(2)
+        with _wiz_c1:
+            wiz_group    = st.text_input("群組名稱", value="tower1_left",  key="wiz_group")
+            wiz_tower_id = st.text_input("塔頂節點 ID", value="",          key="wiz_tower_id")
+            wiz_n        = st.number_input("根數", min_value=1, max_value=50, value=7, step=1, key="wiz_n")
+            wiz_ecc_y    = st.number_input("偏心距 y (m) 右+左-", value=3.0, format="%.3f", key="wiz_ecc_y")
+            wiz_deck_z   = st.number_input("主梁 z 座標 (m)", value=0.0,   format="%.3f", key="wiz_deck_z")
+        with _wiz_c2:
+            wiz_t_off    = st.number_input("塔側起始偏移 (m)", value=-0.5, format="%.3f", key="wiz_t_off")
+            wiz_t_sp     = st.number_input("塔側間距 (m)",     value=-0.5, format="%.3f", key="wiz_t_sp")
+            wiz_dx_start = st.number_input("橋面起始 x (m)",   value=0.0,  format="%.3f", key="wiz_dx_start")
+            wiz_dx_sp    = st.number_input("橋面間距 往跨中+ 往橋台-", value=5.0, format="%.3f", key="wiz_dx_sp")
+
+        if st.button("生成索面", key="wiz_generate"):
+            _node_ids_existing = {str(n.get("id")) for n in nodes_df.dropna(subset=["id"]).to_dict("records")}
+            if str(wiz_tower_id) not in _node_ids_existing:
+                st.error(f"塔頂節點 '{wiz_tower_id}' 不存在於節點表格中。")
+            else:
+                _tw_row = nodes_df[nodes_df["id"].astype(str) == str(wiz_tower_id)].iloc[0]
+                _wiz_params = {
+                    "group_name":         wiz_group,
+                    "tower_node_id":      str(wiz_tower_id),
+                    "tower_node_pos":     {"x": float(_tw_row["x"]), "y": float(_tw_row["y"]), "z": float(_tw_row["z"])},
+                    "tower_offset_start": float(wiz_t_off),
+                    "tower_spacing":      float(wiz_t_sp),
+                    "deck_x_start":       float(wiz_dx_start),
+                    "deck_spacing":       float(wiz_dx_sp),
+                    "n_cables":           int(wiz_n),
+                    "eccentricity_y":     float(wiz_ecc_y),
+                    "deck_z":             float(wiz_deck_z),
+                }
+                _existing_nodes_list = nodes_df.dropna(subset=["id"]).to_dict("records")
+                _gen = generate_cable_face(_wiz_params, _existing_nodes_list)
+
+                _new_nodes = [{k: v for k, v in n.items() if k != "_role"} for n in _gen["nodes"]]
+                _new_elems = [{k: v for k, v in e.items() if k != "_role"} for e in _gen["elements"]]
+
+                _existing_node_ids = {str(n.get("id")) for n in st.session_state.get("nodes_data", [])}
+                for _n in _new_nodes:
+                    if str(_n["id"]) not in _existing_node_ids:
+                        st.session_state.setdefault("nodes_data", []).append(_n)
+                        _existing_node_ids.add(str(_n["id"]))
+
+                st.session_state["elements_data"].extend(_new_elems)
+                st.session_state["rigid_links"].extend(_gen["rigid_links"])
+
+                for _k in ("nodes", "elements", "rl_editor"):
+                    st.session_state.pop(_k, None)
+                st.success(
+                    f"已生成 {len(_new_nodes)} 個節點、"
+                    f"{len(_new_elems)} 根索構件、"
+                    f"{len(_gen['rigid_links'])} 個 Rigid Link。"
+                )
+                st.rerun()
 
     include_sw = st.checkbox("含自重（Self-Weight）", value=False, key="include_sw")
     run_btn = st.button("執行分析（符號解）", type="primary", use_container_width=True)
@@ -624,6 +742,7 @@ truss_data = {
     "loads":               loads_df.dropna(subset=['node_id']).fillna(0).to_dict('records'),
     "element_loads":       e_loads_df.dropna(subset=['element_id']).fillna(0).to_dict('records'),
     "element_point_loads": e_pt_loads_df.dropna(subset=['element_id']).fillna(0).to_dict('records'),
+    "rigid_links":         st.session_state.get("rigid_links", []),
 }
 
 with right_panel:
@@ -644,6 +763,7 @@ with right_panel:
             "loads":                truss_data["loads"],
             "element_loads":        truss_data["element_loads"],
             "element_point_loads":  truss_data["element_point_loads"],
+            "rigid_links":          st.session_state.get("rigid_links", []),
         }
         st.download_button(
             label="💾 存檔（JSON）",
@@ -666,16 +786,17 @@ with right_panel:
                     st.session_state["materials"]           = _loaded.get("materials", [])
                     st.session_state["sections"]            = _loaded.get("sections", [])
                     st.session_state["elements_data"]       = _loaded.get("elements_data", [])
+                    st.session_state["rigid_links"]         = _loaded.get("rigid_links", [])
                     st.session_state["elem_prev_section"]   = {}
                     st.session_state["sym_cache"]           = {}
                     st.session_state.pop("quickfill_overrides", None)
                     st.session_state.pop("quickfill_sec_key", None)
                     # 清除 data_editor 快取，強制從 session_state 重新載入
                     for _k in ("nodes", "elements", "supports", "loads",
-                               "element_loads", "element_point_loads"):
+                               "element_loads", "element_point_loads", "rl_editor"):
                         st.session_state.pop(_k, None)
-                    # 將節點、支承、載重寫入 session_state 供下次 render 使用
-                    st.session_state["_loaded_nodes"]               = _loaded.get("nodes", [])
+                    # 將節點、支承、載重寫入 nodes_data / session_state 供下次 render 使用
+                    st.session_state["nodes_data"]                  = _loaded.get("nodes", [])
                     st.session_state["_loaded_supports"]            = _loaded.get("supports", [])
                     st.session_state["_loaded_loads"]               = _loaded.get("loads", [])
                     st.session_state["_loaded_element_loads"]       = _loaded.get("element_loads", [])
