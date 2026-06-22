@@ -24,6 +24,38 @@ def _compute_fingerprint(nodes_json: str, elements_json: str, supports_json: str
     })
 
 
+@st.cache_data(show_spinner=False)
+def _compute_overridden_ids(sections_json: str, materials_json: str, elem_records_json: str) -> frozenset:
+    import json
+    secs = {s["name"]: s for s in json.loads(sections_json)}
+    mats = {m["name"]: m for m in json.loads(materials_json)}
+
+    def _sec_ref(sn, field):
+        if sn not in secs:
+            return None
+        s = secs[sn]
+        if field in ("E", "G"):
+            return mats.get(s.get("material", ""), {}).get(field)
+        return s.get(field)
+
+    result = set()
+    for r in json.loads(elem_records_json):
+        sn = r.get("section", "")
+        if not sn or sn not in secs:
+            continue
+        for field in ("E", "G", "A", "I33", "I22", "J"):
+            ref = _sec_ref(sn, field)
+            val = r.get(field)
+            if ref is not None and val is not None:
+                try:
+                    if abs(float(val) - ref) > abs(ref) * 1e-9:
+                        result.add(str(r.get("id", "")))
+                        break
+                except (TypeError, ValueError):
+                    pass
+    return frozenset(result)
+
+
 st.set_page_config(page_title="Structural Analysis", layout="wide")
 
 if "sym_cache" not in st.session_state:
@@ -108,8 +140,10 @@ with left_panel:
         },
         num_rows="dynamic", key="mat_editor",
     )
-    # 同步回 session_state（去掉唯讀欄）
-    st.session_state["materials"] = mat_df.drop(columns=["ν (唯讀)"], errors="ignore").dropna(subset=["name"]).to_dict("records")
+    # 同步回 session_state（去掉唯讀欄，只在有變化時更新）
+    _mat_new = mat_df.drop(columns=["ν (唯讀)"], errors="ignore").dropna(subset=["name"]).to_dict("records")
+    if _mat_new != st.session_state["materials"]:
+        st.session_state["materials"] = _mat_new
     mat_names = [m["name"] for m in st.session_state["materials"]]
 
     st.subheader("截面 (Sections)")
@@ -152,7 +186,9 @@ with left_panel:
         },
         num_rows="dynamic", key="sec_editor",
     )
-    st.session_state["sections"] = sec_df.dropna(subset=["name"]).to_dict("records")
+    _sec_new = sec_df.dropna(subset=["name"]).to_dict("records")
+    if _sec_new != st.session_state["sections"]:
+        st.session_state["sections"] = _sec_new
     sec_names = [s["name"] for s in st.session_state["sections"]]
 
     with st.expander("從形狀計算截面參數", expanded=False):
@@ -279,7 +315,9 @@ with left_panel:
     nodes_df = st.data_editor(
         pd.DataFrame(st.session_state["nodes_data"]), num_rows="dynamic", key="nodes"
     )
-    st.session_state["nodes_data"] = nodes_df.dropna(subset=["id"]).to_dict("records")
+    _nodes_new = nodes_df.dropna(subset=["id"]).to_dict("records")
+    if _nodes_new != st.session_state.get("nodes_data"):
+        st.session_state["nodes_data"] = _nodes_new
 
     st.subheader("桿件 (Elements)")
     st.caption(
@@ -351,39 +389,12 @@ with left_panel:
     _mats_json  = _json.dumps(st.session_state["materials"], sort_keys=True)
     _elems_json = _json.dumps(updated_rows, sort_keys=True)
 
-    def _compute_overridden_ids(sections_json, materials_json, elem_records_json):
-        import json
-        secs = {s["name"]: s for s in json.loads(sections_json)}
-        mats = {m["name"]: m for m in json.loads(materials_json)}
-        def sec_val(sn, field):
-            if sn not in secs:
-                return None
-            s = secs[sn]
-            if field in ("E", "G"):
-                return mats.get(s.get("material", ""), {}).get(field)
-            return s.get(field)
-        result = set()
-        for r in json.loads(elem_records_json):
-            sn = r.get("section", "")
-            if not sn or sn not in secs:
-                continue
-            for field in ("E", "G", "A", "I33", "I22", "J"):
-                ref = sec_val(sn, field)
-                val = r.get(field)
-                if ref is not None and val is not None:
-                    try:
-                        if abs(float(val) - ref) > abs(ref) * 1e-9:
-                            result.add(str(r.get("id", "")))
-                            break
-                    except (TypeError, ValueError):
-                        pass
-        return result
-
     _overridden_ids = _compute_overridden_ids(_secs_json, _mats_json, _elems_json)
     for r in updated_rows:
         r["status"] = "● 已修改" if str(r.get("id", "")) in _overridden_ids else ""
 
-    st.session_state["elements_data"] = updated_rows
+    if updated_rows != st.session_state.get("elements_data"):
+        st.session_state["elements_data"] = updated_rows
     elements_df = pd.DataFrame(updated_rows)
 
     if _need_rerun:
@@ -845,28 +856,34 @@ with right_panel:
     res_eval = None
 
     if num_btn:
-        try:
-            _td_num = expand_truss_data(truss_data, st.session_state["materials"], st.session_state["sections"]) if st.session_state["sections"] else truss_data
-            if include_sw and st.session_state["sections"]:
-                import copy as _copy
-                _td_num = _copy.deepcopy(_td_num)
-                sw = compute_self_weight(_td_num, st.session_state["sections"], st.session_state["materials"])
-                _existing = {el["element_id"]: el for el in _td_num.get("element_loads", [])}
-                for _sw in sw:
-                    _eid = _sw["element_id"]
-                    if _eid in _existing:
-                        _existing[_eid]["w"] = _existing[_eid].get("w", 0.0) + _sw["w"]
-                    else:
-                        _td_num["element_loads"].append({"element_id": _eid, "w": _sw["w"]})
-            res_eval = evaluate_numerical_results(_td_num)
-            output_area.json(res_eval)
-            st.info(f"數值分析完成，耗時 {res_eval['eval_time_ms']} ms（直接代入實際參數）。")
-        except Exception as e:
-            if "singular" in str(e).lower() or "not invertible" in str(e).lower():
-                st.error(f"分析失敗：結構不穩定 (奇異矩陣)。請檢查支承是否足夠。\n\n詳細錯誤: {e}")
-            else:
-                st.error(f"數值分析發生錯誤：{e}")
-            st.stop()
+        with st.status("數值分析中...", expanded=True) as _status:
+            try:
+                st.write("建立結構模型...")
+                _td_num = expand_truss_data(truss_data, st.session_state["materials"], st.session_state["sections"]) if st.session_state["sections"] else truss_data
+                if include_sw and st.session_state["sections"]:
+                    import copy as _copy
+                    st.write("計算自重...")
+                    _td_num = _copy.deepcopy(_td_num)
+                    sw = compute_self_weight(_td_num, st.session_state["sections"], st.session_state["materials"])
+                    _existing = {el["element_id"]: el for el in _td_num.get("element_loads", [])}
+                    for _sw in sw:
+                        _eid = _sw["element_id"]
+                        if _eid in _existing:
+                            _existing[_eid]["w"] = _existing[_eid].get("w", 0.0) + _sw["w"]
+                        else:
+                            _td_num["element_loads"].append({"element_id": _eid, "w": _sw["w"]})
+                st.write("組裝剛度矩陣並求解...")
+                res_eval = evaluate_numerical_results(_td_num)
+                _status.update(label=f"數值分析完成（耗時 {res_eval['eval_time_ms']} ms）", state="complete")
+                output_area.json(res_eval)
+                st.info(f"數值分析完成，耗時 {res_eval['eval_time_ms']} ms（直接代入實際參數）。")
+            except Exception as e:
+                _status.update(label="分析失敗", state="error")
+                if "singular" in str(e).lower() or "not invertible" in str(e).lower():
+                    st.error(f"分析失敗：結構不穩定 (奇異矩陣)。請檢查支承是否足夠。\n\n詳細錯誤: {e}")
+                else:
+                    st.error(f"數值分析發生錯誤：{e}")
+                st.stop()
 
         st.divider()
         st.subheader("內力分佈圖 (Internal Force Diagrams)")
@@ -914,45 +931,51 @@ with right_panel:
             st.error(f"代入失敗：{e}")
 
     if run_btn:
-        try:
-            # 清除舊快取，強制重新求解
-            st.session_state["sym_cache"] = {}
+        with st.status("符號解分析中（可能需要數十秒）...", expanded=True) as _status:
+            try:
+                # 清除舊快取，強制重新求解
+                st.session_state["sym_cache"] = {}
 
-            # 建立各斷面組的符號對應
-            _sec_group_map = {}
-            for gi, sec in enumerate(st.session_state["sections"], start=1):
-                sn = sec.get("name", "")
-                if not sn:
-                    continue
-                _sec_group_map[sn] = {
-                    "E":   sp.Symbol(f"E_s{gi}"),
-                    "A":   sp.Symbol(f"A_s{gi}"),
-                    "I33": sp.Symbol(f"I_s{gi}"),
-                    "I22": sp.Symbol(f"I_s{gi}"),
-                    "G":   sp.Symbol(f"G_s{gi}"),
+                # 建立各斷面組的符號對應
+                st.write("建立符號變數...")
+                _sec_group_map = {}
+                for gi, sec in enumerate(st.session_state["sections"], start=1):
+                    sn = sec.get("name", "")
+                    if not sn:
+                        continue
+                    _sec_group_map[sn] = {
+                        "E":   sp.Symbol(f"E_s{gi}"),
+                        "A":   sp.Symbol(f"A_s{gi}"),
+                        "I33": sp.Symbol(f"I_s{gi}"),
+                        "I22": sp.Symbol(f"I_s{gi}"),
+                        "G":   sp.Symbol(f"G_s{gi}"),
+                    }
+
+                st.write("組裝符號剛度矩陣並求解（SymPy）...")
+                _run_group_vals = {
+                    sn: {"E": v["E"], "A": v["A"], "I": v["I33"], "G": v["G"]}
+                    for sn, v in st.session_state.get("quickfill_overrides", {}).items()
                 }
-
-            _run_group_vals = {
-                sn: {"E": v["E"], "A": v["A"], "I": v["I33"], "G": v["G"]}
-                for sn, v in st.session_state.get("quickfill_overrides", {}).items()
-            }
-            real_params = {"groups": _run_group_vals, "P": pe_P, "w": pe_w}
-            res_eval = evaluate_real_results(
-                truss_data, real_params,
-                symbolic_cache=st.session_state["sym_cache"],
-                materials=st.session_state["materials"],
-                sections=st.session_state["sections"],
-                include_self_weight=include_sw,
-                section_group_map=_sec_group_map if _sec_group_map else None,
-            )
-            res = st.session_state["sym_cache"]["raw_result"]
-            output_area.json(res_eval)
-        except Exception as e:
-            if "singular" in str(e).lower() or "not invertible" in str(e).lower():
-                st.error(f"分析失敗：結構不穩定 (出現奇異矩陣)。請檢查是否有足夠的支承，或者是否有機構 (Mechanism) 產生！\n\n詳細錯誤: {e}")
-            else:
-                st.error(f"分析時發生錯誤：{e}")
-            st.stop()
+                real_params = {"groups": _run_group_vals, "P": pe_P, "w": pe_w}
+                res_eval = evaluate_real_results(
+                    truss_data, real_params,
+                    symbolic_cache=st.session_state["sym_cache"],
+                    materials=st.session_state["materials"],
+                    sections=st.session_state["sections"],
+                    include_self_weight=include_sw,
+                    section_group_map=_sec_group_map if _sec_group_map else None,
+                )
+                st.write("代入數值並整理結果...")
+                res = st.session_state["sym_cache"]["raw_result"]
+                _status.update(label=f"符號解分析完成（耗時 {res_eval['eval_time_ms']} ms）", state="complete")
+                output_area.json(res_eval)
+            except Exception as e:
+                _status.update(label="分析失敗", state="error")
+                if "singular" in str(e).lower() or "not invertible" in str(e).lower():
+                    st.error(f"分析失敗：結構不穩定 (出現奇異矩陣)。請檢查是否有足夠的支承，或者是否有機構 (Mechanism) 產生！\n\n詳細錯誤: {e}")
+                else:
+                    st.error(f"分析時發生錯誤：{e}")
+                st.stop()
 
         # 新增：繪製內力圖 (ND, VD, MD)
         st.divider()
