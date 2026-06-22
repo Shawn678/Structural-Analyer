@@ -79,17 +79,13 @@ def evaluate_real_results(
     if materials and sections:
         truss_data = expand_truss_data(truss_data, materials, sections)
 
-    # 自重疊加
+    # 自重在此只預先計算，待倍率套用後再疊加到 td_num，避免自重被當係數乘上倍率
+    _sw_elem_loads = []
+    _sw_node_loads = []
     if include_self_weight and materials and sections:
-        sw_loads = compute_self_weight(truss_data, sections, materials)
-        truss_data = copy.deepcopy(truss_data)
-        existing = {el["element_id"]: el for el in truss_data.get("element_loads", [])}
-        for sw in sw_loads:
-            eid = sw["element_id"]
-            if eid in existing:
-                existing[eid]["w"] = existing[eid].get("w", 0.0) + sw["w"]
-            else:
-                truss_data["element_loads"].append({"element_id": eid, "w": sw["w"]})
+        _sw = compute_self_weight(truss_data, sections, materials)
+        _sw_elem_loads = _sw["element_loads"]
+        _sw_node_loads = _sw["node_loads"]
 
     # ── 取得或建立快取 ────────────────────────────────────────────────────
     if symbolic_cache is not None and "raw_result" in symbolic_cache:
@@ -219,11 +215,27 @@ def evaluate_real_results(
             for el in td_num["element_loads"]:
                 if "w" in el:
                     el["w"] = float(el["w"]) * _w
-        # 若 use_per_elem，element_loads 已是實際數值（自重），直接使用
         for el in td_num["element_point_loads"]:
             if "p" in el:
                 el["p"] = float(el["p"]) * _P
 
+    # 自重疊加：在倍率套用後才加，確保自重不被乘上倍率
+    if _sw_elem_loads:
+        existing_w = {el["element_id"]: el for el in td_num.get("element_loads", [])}
+        for sw in _sw_elem_loads:
+            eid = sw["element_id"]
+            if eid in existing_w:
+                existing_w[eid]["w"] = existing_w[eid].get("w", 0.0) + sw["w"]
+            else:
+                td_num["element_loads"].append({"element_id": eid, "w": sw["w"]})
+    if _sw_node_loads:
+        existing_n = {ld["node_id"]: ld for ld in td_num.get("loads", [])}
+        for nl in _sw_node_loads:
+            nid = nl["node_id"]
+            if nid in existing_n:
+                existing_n[nid]["fz"] = existing_n[nid].get("fz", 0.0) + nl["fz"]
+            else:
+                td_num["loads"].append({"node_id": nid, "fz": nl["fz"]})
     num = run_numerical_analysis(td_num)
 
     element_forces = []

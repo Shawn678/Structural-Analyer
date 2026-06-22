@@ -180,8 +180,9 @@ def expand_truss_data(truss_data: dict, materials: list, sections: list) -> dict
         # 逐欄填入，以數值比較判斷是否為 override。若 elem 中的值與 section 值不同，視為故意 override 保留；
         # 若相同或不存在，從 section 填入（允許 Streamlit UI 預先註冊所有欄位的情況）
         for key, src_val in [
-            ("E",   float(mat.get("E",   0))),
-            ("G",   float(mat.get("G",   0))),
+            ("E",       float(mat.get("E",       0))),
+            ("G",       float(mat.get("G",       0))),
+            ("density", float(mat.get("density", 0))),
             ("A",   props["A"]),
             ("I33", props["I33"]),
             ("I22", props["I22"]),
@@ -201,20 +202,70 @@ def expand_truss_data(truss_data: dict, materials: list, sections: list) -> dict
 
 # ── 自重計算 ───────────────────────────────────────────────────────────────
 
-def compute_self_weight(truss_data_expanded: dict, sections: list, materials: list) -> list:
-    """回傳 element_loads 格式的自重清單（w 為負值，向下）。"""
-    mat_map = {m["name"]: m for m in materials}
-    sec_map = {s["name"]: s for s in sections}
+def compute_self_weight(truss_data_expanded: dict, sections: list, materials: list) -> dict:
+    """回傳自重清單，分為兩部分：
+    - element_loads：橫向自重分量（w，N/m），適用於斜向或水平桿件
+    - node_loads：完全垂直桿件的等效節點力（fz，N），兩端各承受 w_axial*L/2
 
-    result = []
+    重力（global -Z）投影到 local y2 得橫向分量；完全垂直桿件（w_proj≈0）
+    改以等效端點節點力處理，確保軸向自重正確傳遞。
+    """
+    mat_map  = {m["name"]: m for m in materials}
+    sec_map  = {s["name"]: s for s in sections}
+    node_pos = {int(n["id"]): np.array([float(n.get("x", 0)),
+                                         float(n.get("y", 0)),
+                                         float(n.get("z", 0))])
+                for n in truss_data_expanded["nodes"]}
+    gravity = np.array([0., 0., -1.])
+
+    element_loads = []
+    node_loads    = []
+
     for elem in truss_data_expanded["elements"]:
-        sec_name = elem.get("section")
-        if not sec_name or sec_name not in sec_map:
+        # 從 expand_truss_data 已填入的 density 欄位取值
+        density = float(elem.get("density") or 0)
+        if not density:
             continue
-        sec = sec_map[sec_name]
-        mat = mat_map.get(sec.get("material", ""), {})
-        density = float(mat.get("density", 0))
-        A_eff   = float(elem.get("A", 0))
-        w_self  = -(density * A_eff * 9.81)
-        result.append({"element_id": elem["id"], "w": w_self})
-    return result
+
+        A_eff = float(elem.get("A") or 0)
+        if A_eff <= 0:
+            continue
+
+        ni, nj = int(elem.get("i")), int(elem.get("j"))
+        if ni not in node_pos or nj not in node_pos:
+            continue
+
+        pi, pj = node_pos[ni], node_pos[nj]
+        v1 = pj - pi
+        Le = float(np.linalg.norm(v1))
+        if Le < 1e-12:
+            continue
+        v1 = v1 / Le
+
+        # 與 symbolic.py _assemble_K_np 相同的 local 座標系
+        is_vertical = (v1[0]**2 + v1[1]**2) < 1e-12
+        if not is_vertical:
+            v3_dir = np.cross(v1, np.array([0., 0., 1.]))
+            v3 = v3_dir / np.linalg.norm(v3_dir)
+            v2 = np.cross(v3, v1)
+        else:
+            v2 = np.array([1., 0., 0.])
+            v3 = np.cross(v1, v2)
+            v3 = v3 / np.linalg.norm(v3)
+
+        beta_val = float(elem.get("beta") or 0)
+        if abs(beta_val) > 1e-10:
+            br = beta_val * math.pi / 180
+            v2 = math.cos(br) * v2 + math.sin(br) * v3
+
+        total_w = density * A_eff * 9.81
+        w_proj = float(np.dot(gravity, v2))
+
+        if abs(w_proj) < 1e-6:
+            f_node = -total_w * Le / 2
+            for nid in (ni, nj):
+                node_loads.append({"node_id": nid, "fz": f_node})
+        else:
+            element_loads.append({"element_id": elem["id"], "w": total_w * w_proj})
+
+    return {"element_loads": element_loads, "node_loads": node_loads}

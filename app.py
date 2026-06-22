@@ -864,14 +864,21 @@ with right_panel:
                     import copy as _copy
                     st.write("計算自重...")
                     _td_num = _copy.deepcopy(_td_num)
-                    sw = compute_self_weight(_td_num, st.session_state["sections"], st.session_state["materials"])
-                    _existing = {el["element_id"]: el for el in _td_num.get("element_loads", [])}
-                    for _sw in sw:
-                        _eid = _sw["element_id"]
-                        if _eid in _existing:
-                            _existing[_eid]["w"] = _existing[_eid].get("w", 0.0) + _sw["w"]
+                    _sw = compute_self_weight(_td_num, st.session_state["sections"], st.session_state["materials"])
+                    _existing_el = {el["element_id"]: el for el in _td_num.get("element_loads", [])}
+                    for _swl in _sw["element_loads"]:
+                        _eid = _swl["element_id"]
+                        if _eid in _existing_el:
+                            _existing_el[_eid]["w"] = _existing_el[_eid].get("w", 0.0) + _swl["w"]
                         else:
-                            _td_num["element_loads"].append({"element_id": _eid, "w": _sw["w"]})
+                            _td_num["element_loads"].append({"element_id": _eid, "w": _swl["w"]})
+                    _existing_nl = {ld["node_id"]: ld for ld in _td_num.get("loads", [])}
+                    for _nl in _sw["node_loads"]:
+                        _nid = _nl["node_id"]
+                        if _nid in _existing_nl:
+                            _existing_nl[_nid]["fz"] = _existing_nl[_nid].get("fz", 0.0) + _nl["fz"]
+                        else:
+                            _td_num["loads"].append({"node_id": _nid, "fz": _nl["fz"]})
                 st.write("組裝剛度矩陣並求解...")
                 res_eval = evaluate_numerical_results(_td_num)
                 _status.update(label=f"數值分析完成（耗時 {res_eval['eval_time_ms']} ms）", state="complete")

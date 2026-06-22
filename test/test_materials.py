@@ -112,11 +112,11 @@ def test_expand_fills_when_value_matches_section():
 def test_self_weight_value():
     td_exp = expand_truss_data(TRUSS, MATERIALS, SECTIONS)
     sw = compute_self_weight(td_exp, SECTIONS, MATERIALS)
-    # w = density * A * g = 7850 * 0.01 * 9.81 = 770.085 N/m，向下為負
+    # 水平桿件：w = density * A * g，向下為負
     expected_w = -(7850 * 0.01 * 9.81)
-    assert len(sw) == 1
-    assert sw[0]["element_id"] == 1
-    assert abs(sw[0]["w"] - expected_w) < 0.01
+    assert len(sw["element_loads"]) == 1
+    assert sw["element_loads"][0]["element_id"] == 1
+    assert abs(sw["element_loads"][0]["w"] - expected_w) < 0.01
 
 def test_self_weight_override_uses_overridden_A():
     import copy
@@ -125,7 +125,7 @@ def test_self_weight_override_uses_overridden_A():
     td_exp = expand_truss_data(truss, MATERIALS, SECTIONS)
     sw = compute_self_weight(td_exp, SECTIONS, MATERIALS)
     expected_w = -(7850 * 0.02 * 9.81)
-    assert abs(sw[0]["w"] - expected_w) < 0.01
+    assert abs(sw["element_loads"][0]["w"] - expected_w) < 0.01
 
 
 # ── Task 2: symbolic per-section ──────────────────────────────────────────
