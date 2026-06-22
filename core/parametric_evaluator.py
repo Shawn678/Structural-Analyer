@@ -48,9 +48,10 @@ def build_geometry_fingerprint(truss_data: dict) -> dict:
 def _subs_value(formula_str: str, subs_dict: dict) -> float | None:
     """將公式字串代入數值，回傳 float；失敗或結果非有限數時回傳 None。"""
     try:
-        # fmt() 將 '*' 轉換為 '·'（U+00B7），sympify 無法解析，需先還原
         cleaned = formula_str.replace('·', '*').replace('^', '**')
-        expr = sp.sympify(cleaned)
+        # 建立 local_dict，讓 E/I 被解析為 Symbol 而非 Euler number / 虛數單位
+        local_dict = {str(k): k for k in subs_dict if isinstance(k, sp.Basic)}
+        expr = sp.parse_expr(cleaned, local_dict=local_dict)
         result = float(expr.subs(subs_dict))
         return result if np.isfinite(result) else None
     except Exception:

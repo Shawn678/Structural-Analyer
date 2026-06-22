@@ -241,14 +241,11 @@ def _build_basis_row(elem_Ls, E_s, A_s, I_s, G_s, mode,
         J_k = max(2.0 * I_k, 1e-30)
 
         if mode == 'P':
-            row.append(Lk**3 / (E_k * I_k))   # EI33 彎曲主項
-            row.append(Lk**2 / (E_k * I_k))   # EI33 彎曲次項
-            row.append(Lk    / (E_k * A_k))   # EA 軸向
-            row.append(Lk    / (G_k * J_k))   # GJ 扭轉
-            row.append(Lk**3 / (E_k * I_k))   # EI22 面外（I22=I，合併入 EI33）
+            row.append(1.0 / (E_k * I_k))   # 彎曲基底（L 冪次折入係數）
+            row.append(1.0 / (E_k * A_k))   # 軸向基底
+            row.append(1.0 / (G_k * J_k))   # 扭轉基底
         else:  # 'w'
-            row.append(Lk**4 / (E_k * I_k))   # 均佈載重主項
-            row.append(Lk**3 / (E_k * I_k))   # 均佈載重次項
+            row.append(1.0 / (E_k * I_k))   # 均佈載重基底
     return np.array(row, dtype=np.float64)
 
 
@@ -283,11 +280,9 @@ def _fit_and_symbolize(samples_P, samples_w, basis_P, basis_w,
             A_k = A_sym
             I_k = I_sym
             G_k = G_sym
-        sym_bases_P.append(Lk_sym**3 / (E_k * I_k))
-        sym_bases_P.append(Lk_sym**2 / (E_k * I_k))
-        sym_bases_P.append(Lk_sym    / (E_k * A_k))
-        sym_bases_P.append(Lk_sym    / (2 * G_k * I_k))  # J = 2I 假設，與 _build_basis_row 數值側一致
-        sym_bases_P.append(Lk_sym**3 / (E_k * I_k))  # EI22 合併
+        sym_bases_P.append(sp.S.One / (E_k * I_k))          # 彎曲：係數中含 L 冪次
+        sym_bases_P.append(sp.S.One / (E_k * A_k))          # 軸向
+        sym_bases_P.append(sp.S.One / (2 * G_k * I_k))      # 扭轉（J=2I）
     for k, Lk_sym in enumerate(L_syms):
         if elem_E_syms is not None:
             E_k = elem_E_syms[k]
@@ -295,8 +290,7 @@ def _fit_and_symbolize(samples_P, samples_w, basis_P, basis_w,
         else:
             E_k = E_sym
             I_k = I_sym
-        sym_bases_w.append(Lk_sym**4 / (E_k * I_k))
-        sym_bases_w.append(Lk_sym**3 / (E_k * I_k))
+        sym_bases_w.append(sp.S.One / (E_k * I_k))          # 均佈載重：係數含 L 冪次
 
     def _fit(B, b_col):
         """lstsq 擬合，回傳係數與相對殘差。"""
@@ -512,12 +506,13 @@ def run_symbolic_analysis(truss_data: dict, section_group_map: dict | None = Non
     print(f"-> [Step 1/4] 拓樸解析完成，桿件數={n_elem}，自由度={len(free_dofs)}。耗時: {time.time()-start_time:.2f}s")
 
     # ── 多點採樣 ─────────────────────────────────────────────────────────
-    SAMPLE_SCALES = [1.0, 5.0, 25.0, 100.0, 500.0, 2000.0]
-    n_samples = max(len(SAMPLE_SCALES), n_elem * 5 + 2)
-    # 不足時，以對數等距補齊
-    if n_samples > len(SAMPLE_SCALES):
-        extra = np.logspace(0, 4, n_samples - len(SAMPLE_SCALES) + 1)[1:].tolist()
-        SAMPLE_SCALES = SAMPLE_SCALES + [s * 10 for s in extra[:n_samples - len(SAMPLE_SCALES)]]
+    # 路徑 (A)（無 section_group_map）使用獨立材料採樣：E/A/I/G 分別給不同 scale，
+    # 使 basis 欄（L³/EI, L²/EI, L/EA, L/GJ）線性獨立。
+    # 每列 = [sE, sA, sI, sG]，由隨機對數空間採樣產生。
+    rng_mat = np.random.default_rng(42)
+    n_samples = max(8, n_elem * 3 + 4)
+    # 4 個材料參數各自的獨立 scale（對數均勻分布在 [1, 1e4]）
+    _mat_scales = np.exp(rng_mat.uniform(0, np.log(1e4), size=(n_samples, 4)))
 
     # F_P/F_w 只含 P/w 線性係數，不隨材料 scale 變化，迴圈外算一次
     F_P_np_free = np.array([float(F_P_sym[d, 0].subs(P_sym, 1)) for d in free_dofs])
@@ -549,11 +544,11 @@ def run_symbolic_analysis(truss_data: dict, section_group_map: dict | None = Non
 
     # (B) Hadamard 交叉採樣前置：計算 n_samples 與交叉擾動矩陣
     if _n_groups > 0:
-        n_samples = max(len(SAMPLE_SCALES), _n_groups * 4 + 4)
-        # 補齊 SAMPLE_SCALES 至 n_samples（保持陣列尺寸一致性）
-        if n_samples > len(SAMPLE_SCALES):
-            extra = np.logspace(0, 4, n_samples - len(SAMPLE_SCALES) + 1)[1:].tolist()
-            SAMPLE_SCALES = SAMPLE_SCALES + [s * 10 for s in extra[:n_samples - len(SAMPLE_SCALES)]]
+        n_samples = max(n_samples, _n_groups * 4 + 4)
+        # 擴充 _mat_scales 以對齊更新後的 n_samples
+        if n_samples > _mat_scales.shape[0]:
+            _extra = np.exp(rng_mat.uniform(0, np.log(1e4), size=(n_samples - _mat_scales.shape[0], 4)))
+            _mat_scales = np.vstack([_mat_scales, _extra])
         # 取每組基準材料值（從屬於該組的第一根桿件）
         _group_base = []
         for gname in _group_names:
@@ -569,8 +564,8 @@ def run_symbolic_analysis(truss_data: dict, section_group_map: dict | None = Non
     # 重新分配採樣陣列（n_samples 可能被 _n_groups 更新）
     samples_P_full = np.zeros((n_samples, total_dof))
     samples_w_full = np.zeros((n_samples, total_dof))
-    basis_P_rows   = np.zeros((n_samples, n_elem * 5))
-    basis_w_rows   = np.zeros((n_samples, n_elem * 2))
+    basis_P_rows   = np.zeros((n_samples, n_elem * 3))
+    basis_w_rows   = np.zeros((n_samples, n_elem * 1))
     # 反力採樣（indexed by fixed_dofs_list 位置）
     _n_fixed = len(fixed_dofs_list)
     samples_react_P = np.zeros((n_samples, _n_fixed))
@@ -618,25 +613,26 @@ def run_symbolic_analysis(truss_data: dict, section_group_map: dict | None = Non
             G_s = G_base * global_scale
             K_s, elems_s, _, free_s = _assemble_K_np(td_scaled, E_s, A_s, I_s, G_s)
         else:
-            # (A) 原有邏輯：全域均勻 scale
-            scale = SAMPLE_SCALES[s_idx] if s_idx < len(SAMPLE_SCALES) else SAMPLE_SCALES[-1]
-            E_s = E_base * scale
-            A_s = A_base * scale
-            I_s = I_base * scale
-            G_s = G_base * scale
+            # (A) 獨立材料採樣：E/A/I/G 各自使用不同 scale，使 basis 欄線性獨立
+            sE, sA, sI, sG = _mat_scales[s_idx]
+            E_s = E_base * sE
+            A_s = A_base * sA
+            I_s = I_base * sI
+            G_s = G_base * sG
 
-            if per_elem_E is not None:
-                # element-ID keyed section_group_map：均勻縮放各桿件的實際屬性
-                td_scaled = copy.deepcopy(truss_data)
-                for k, elem in enumerate(td_scaled['elements']):
-                    elem['E']   = per_elem_E[k] * scale
-                    elem['A']   = per_elem_A[k] * scale
-                    elem['I33'] = per_elem_I[k] * scale
-                    elem['I22'] = per_elem_I[k] * scale
-                    elem['G']   = per_elem_G[k] * scale
-                K_s, elems_s, _, free_s = _assemble_K_np(td_scaled, E_s, A_s, I_s, G_s)
-            else:
-                K_s, elems_s, _, free_s = _assemble_K_np(truss_data, E_s, A_s, I_s, G_s)
+            # 無論是否有 per_elem，都必須覆寫桿件材料，否則 _assemble_K_np 優先用桿件既有值
+            td_scaled = copy.deepcopy(truss_data)
+            _base_E = per_elem_E if per_elem_E is not None else [E_base] * n_elem
+            _base_A = per_elem_A if per_elem_A is not None else [A_base] * n_elem
+            _base_I = per_elem_I if per_elem_I is not None else [I_base] * n_elem
+            _base_G = per_elem_G if per_elem_G is not None else [G_base] * n_elem
+            for k, elem in enumerate(td_scaled['elements']):
+                elem['E']   = _base_E[k] * sE
+                elem['A']   = _base_A[k] * sA
+                elem['I33'] = _base_I[k] * sI
+                elem['I22'] = _base_I[k] * sI
+                elem['G']   = _base_G[k] * sG
+            K_s, elems_s, _, free_s = _assemble_K_np(td_scaled, E_s, A_s, I_s, G_s)
 
         # free_s（來自 _assemble_K_np）含 slave DOF，需排除後才能與凝縮矩陣對齊
         free_s_no_slave = [d for d in free_s if d not in slave_dofs_set]
@@ -714,24 +710,37 @@ def run_symbolic_analysis(truss_data: dict, section_group_map: dict | None = Non
                 elem_G_list=elem_G_scaled,
             )
         elif per_elem_E is not None:
-            # element-ID keyed path：basis 使用各桿件實際材料參數（×均勻 scale）
+            # element-ID keyed path：basis 使用各桿件實際材料參數（×獨立 scale）
             basis_P_rows[s_idx] = _build_basis_row(
                 elem_Ls, E_s, A_s, I_s, G_s, 'P',
-                elem_E_list=[v * scale for v in per_elem_E],
-                elem_A_list=[v * scale for v in per_elem_A],
-                elem_I_list=[v * scale for v in per_elem_I],
-                elem_G_list=[v * scale for v in per_elem_G],
+                elem_E_list=[v * sE for v in per_elem_E],
+                elem_A_list=[v * sA for v in per_elem_A],
+                elem_I_list=[v * sI for v in per_elem_I],
+                elem_G_list=[v * sG for v in per_elem_G],
             )
             basis_w_rows[s_idx] = _build_basis_row(
                 elem_Ls, E_s, A_s, I_s, G_s, 'w',
-                elem_E_list=[v * scale for v in per_elem_E],
-                elem_A_list=[v * scale for v in per_elem_A],
-                elem_I_list=[v * scale for v in per_elem_I],
-                elem_G_list=[v * scale for v in per_elem_G],
+                elem_E_list=[v * sE for v in per_elem_E],
+                elem_A_list=[v * sA for v in per_elem_A],
+                elem_I_list=[v * sI for v in per_elem_I],
+                elem_G_list=[v * sG for v in per_elem_G],
             )
         else:
-            basis_P_rows[s_idx] = _build_basis_row(elem_Ls, E_s, A_s, I_s, G_s, 'P')
-            basis_w_rows[s_idx] = _build_basis_row(elem_Ls, E_s, A_s, I_s, G_s, 'w')
+            # 路徑 (A)：傳入各桿件的採樣後材料值（_base_* × scale）
+            basis_P_rows[s_idx] = _build_basis_row(
+                elem_Ls, E_s, A_s, I_s, G_s, 'P',
+                elem_E_list=[v * sE for v in _base_E],
+                elem_A_list=[v * sA for v in _base_A],
+                elem_I_list=[v * sI for v in _base_I],
+                elem_G_list=[v * sG for v in _base_G],
+            )
+            basis_w_rows[s_idx] = _build_basis_row(
+                elem_Ls, E_s, A_s, I_s, G_s, 'w',
+                elem_E_list=[v * sE for v in _base_E],
+                elem_A_list=[v * sA for v in _base_A],
+                elem_I_list=[v * sI for v in _base_I],
+                elem_G_list=[v * sG for v in _base_G],
+            )
 
     print(f"-> [Step 2/4] 採樣完成。耗時: {time.time()-start_time:.2f}s")
 
