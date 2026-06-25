@@ -2,6 +2,7 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 import math
+from collections import defaultdict
 
 def _norm_id(val) -> str:
     s = str(val).strip()
@@ -214,7 +215,6 @@ def _sort_member_elements(elem_forces, truss_data):
         )
 
     # 建立節點連接圖 (node_id -> list of eid)
-    from collections import defaultdict
     node_edges = defaultdict(list)
     eid_to_ij = {}
     for ef in elem_forces:
@@ -230,7 +230,7 @@ def _sort_member_elements(elem_forces, truss_data):
     # 找度數為 1 的端點（鏈起點）
     degree = {nid: len(eids) for nid, eids in node_edges.items()}
     endpoints = [nid for nid, d in degree.items() if d == 1]
-    # 按節點座標排序，確保從幾何上最小的端點出發（x→y→z）
+    # Sort by geometry so chain always starts from the spatially smallest endpoint (deterministic for typical beam/cable arrangements).
     endpoints.sort(key=lambda nid: (
         float(node_map.get(nid, {}).get("x", 0)),
         float(node_map.get(nid, {}).get("y", 0)),
