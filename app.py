@@ -346,7 +346,52 @@ def _render_result_tabs(res_eval, truss_data):
 
     # ── Tab 3 & 4：待實作 ───────────────────────────────────────────────
     with tab3:
-        st.info("桿件內力摘要（即將實作）")
+        force_rows = []
+        elem_member_map_t3 = {
+            _norm_id(str(e.get("id", ""))): str(e.get("member", "")).strip()
+            for e in st.session_state.get("elements_data", [])
+        }
+        for ef in res_eval.get("element_forces", []):
+            eid = str(ef["element_id"])
+            member = elem_member_map_t3.get(_norm_id(eid), "")
+            force_rows.append({
+                "桿件 ID":       eid,
+                "Member":        member if member else "(未分組)",
+                "N (kN)":        _extract_val(ef.get("N", 0)) / 1000,
+                "V2 (kN)":       _extract_val(ef.get("V2", 0)) / 1000,
+                "V3 (kN)":       _extract_val(ef.get("V3", 0)) / 1000,
+                "M2_i (kN·m)":  _extract_val(ef.get("M2_i", 0)) / 1000,
+                "M2_j (kN·m)":  _extract_val(ef.get("M2_j", 0)) / 1000,
+                "M3_i (kN·m)":  _extract_val(ef.get("M3_i", 0)) / 1000,
+                "M3_j (kN·m)":  _extract_val(ef.get("M3_j", 0)) / 1000,
+                "Le (m)":        float(ef.get("Le", 0)),
+            })
+        force_df = pd.DataFrame(force_rows)
+        if not force_df.empty:
+            all_members_t3 = sorted(force_df["Member"].unique().tolist())
+            sel_members_t3 = st.multiselect(
+                "篩選 Member 群組", all_members_t3, default=all_members_t3, key="tab3_member_filter"
+            )
+            eid_filter = st.text_input("篩選桿件 ID（部分匹配）", value="", key="tab3_eid_filter")
+            filtered_f = force_df[force_df["Member"].isin(sel_members_t3)] if sel_members_t3 else pd.DataFrame(columns=force_df.columns)
+            if eid_filter.strip():
+                filtered_f = filtered_f[filtered_f["桿件 ID"].str.contains(eid_filter.strip(), na=False)]
+            # 摘要：最大彎矩 M3（取 M3_i 與 M3_j 的絕對值最大者）
+            m3_abs = force_df[["M3_i (kN·m)", "M3_j (kN·m)"]].abs().max(axis=1)
+            max_idx = m3_abs.idxmax()
+            max_m3_row = force_df.loc[max_idx]
+            max_m3_val = m3_abs[max_idx]
+            st.caption(
+                f"最大彎矩 |M3| = {max_m3_val:.3f} kN·m"
+                f"（桿件 {max_m3_row['桿件 ID']}，Member {max_m3_row['Member']}）"
+            )
+            fmt_cols = {c: "{:.3f}" for c in force_df.columns if c not in ("桿件 ID", "Member")}
+            st.dataframe(
+                filtered_f.style.format(fmt_cols),
+                use_container_width=True, hide_index=True,
+            )
+        else:
+            st.info("無桿件內力資料。")
     with tab4:
         st.info("內力圖（即將實作）")
 
