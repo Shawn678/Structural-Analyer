@@ -393,7 +393,117 @@ def _render_result_tabs(res_eval, truss_data):
         else:
             st.info("無桿件內力資料。")
     with tab4:
-        st.info("內力圖（即將實作）")
+        import sympy as _sp
+        _x_sym = _sp.Symbol('x')
+
+        elem_member_map_t4 = {
+            _norm_id(str(e.get("id", ""))): str(e.get("member", "")).strip()
+            for e in st.session_state.get("elements_data", [])
+        }
+
+        # 依 member 分組
+        member_groups_t4 = {}
+        for ef in res_eval.get("element_forces", []):
+            eid = str(ef["element_id"])
+            member = elem_member_map_t4.get(_norm_id(eid), "")
+            key = member if member else "(未分組)"
+            member_groups_t4.setdefault(key, []).append(ef)
+
+        all_members_t4 = sorted(member_groups_t4.keys())
+        sel_members_t4 = st.multiselect(
+            "顯示構件群組", all_members_t4, default=all_members_t4, key="tab4_member_filter"
+        )
+
+        for mb_key in all_members_t4:
+            if mb_key not in sel_members_t4:
+                continue
+            mb_elems = _sort_member_elements(member_groups_t4[mb_key], truss_data)
+            total_L = sum(float(ef.get("Le", 0)) for ef in mb_elems)
+
+            with st.expander(f"{mb_key}（共 {len(mb_elems)} 段，總長 {total_L:.2f} m）", expanded=True):
+                fig_t4 = make_subplots(
+                    rows=1, cols=3,
+                    subplot_titles=("軸力圖 N (kN)", "剪力圖 V2 (kN)", "彎矩圖 M3 (kN·m)")
+                )
+                # 接縫位置（用於垂直虛線）
+                seam_xs = []
+                x_global = 0.0
+
+                for seg_idx, ef in enumerate(mb_elems):
+                    Le = float(ef.get("Le", 0))
+                    x_local = np.linspace(0, Le, max(20, int(Le * 10)))
+                    offset = ef["_x_offset"]
+                    x_plot = x_local + offset
+
+                    # 收集接縫（除第一段起點外）
+                    if seg_idx > 0:
+                        seam_xs.append(offset)
+
+                    # 取得各分量的 y 值
+                    def _get_y(key):
+                        raw_val = ef.get(key, 0)
+                        # 數值解路徑：純數字
+                        if not isinstance(raw_val, dict):
+                            if key in ("M3_i", "M3"):
+                                m3_i = float(ef.get("M3_i", 0))
+                                m3_j = float(ef.get("M3_j", 0))
+                                return m3_i + (m3_j - m3_i) * x_local / Le if Le > 0 else np.zeros_like(x_local)
+                            return np.full_like(x_local, float(raw_val) if raw_val is not None else 0.0)
+                        # 符號解路徑：formula string
+                        formula_str = raw_val.get("formula", "0")
+                        try:
+                            expr = _sp.parse_expr(formula_str.replace('^', '**'))
+                            f_np = _sp.lambdify(_x_sym, expr, modules=[
+                                'numpy', {'Heaviside': lambda x: np.where(x >= 0, 1, 0)}
+                            ])
+                            y = f_np(x_local)
+                            if isinstance(y, (int, float, np.float64)):
+                                y = np.full_like(x_local, float(y))
+                            return y
+                        except Exception:
+                            return np.zeros_like(x_local)
+
+                    # 軸力 N
+                    y_N  = _get_y("N") / 1000
+                    # 剪力 V2
+                    y_V2 = _get_y("V2") / 1000
+                    # 彎矩 M3：數值解用線性插值，符號解用 formula
+                    if isinstance(ef.get("M3", ef.get("M3_i", 0)), dict):
+                        y_M3 = _get_y("M3") / 1000
+                    else:
+                        m3_i = float(ef.get("M3_i", 0)) / 1000
+                        m3_j = float(ef.get("M3_j", 0)) / 1000
+                        y_M3 = m3_i + (m3_j - m3_i) * x_local / Le if Le > 0 else np.zeros_like(x_local)
+
+                    show_legend = (seg_idx == 0)
+                    for col_idx, (y_vals, color, name) in enumerate([
+                        (y_N,  "steelblue",   "N"),
+                        (y_V2, "steelblue",   "V2"),
+                        (y_M3, "crimson",     "M3"),
+                    ], start=1):
+                        fig_t4.add_trace(
+                            go.Scatter(
+                                x=x_plot, y=y_vals,
+                                name=name, fill='tozeroy',
+                                line=dict(color=color),
+                                showlegend=False,
+                            ),
+                            row=1, col=col_idx,
+                        )
+
+                # 接縫垂直虛線（加在所有三個子圖）
+                for sx in seam_xs:
+                    for col_idx in (1, 2, 3):
+                        fig_t4.add_vline(
+                            x=sx, line_dash="dot", line_color="gray", line_width=1,
+                            row=1, col=col_idx,
+                        )
+
+                fig_t4.update_layout(
+                    height=380, showlegend=False, template="plotly_white"
+                )
+                fig_t4.update_xaxes(title_text="累積弧長 (m)")
+                st.plotly_chart(fig_t4, use_container_width=True, key=f"ifd_t4_{mb_key}")
 
 
 def create_structure_plot(nodes_df, elements_df, supports_df=None, reactions=None, rigid_links=None):
@@ -1810,58 +1920,6 @@ with right_panel:
                     st.error(f"數值分析發生錯誤：{e}")
                 st.stop()
 
-        st.divider()
-        st.subheader("內力分佈圖 (Internal Force Diagrams)")
-
-        _elem_member_map = {
-            _norm_id(e.get("id", 0)): str(e.get("member", "")).strip()
-            for e in st.session_state.get("elements_data", [])
-        }
-        _all_members = sorted({m for m in _elem_member_map.values() if m})
-        _has_ungrouped_num = any(m == "" for m in _elem_member_map.values())
-        _member_opts_num = _all_members + (["(未分組)"] if _has_ungrouped_num else [])
-        if _member_opts_num:
-            _sel_members_num = st.multiselect(
-                "顯示構件群組", _member_opts_num, default=_member_opts_num,
-                key="ifd_member_filter_num"
-            )
-        else:
-            _sel_members_num = []
-
-        def _num_member_visible(eid):
-            if not _member_opts_num:
-                return True
-            m = _elem_member_map.get(_norm_id(eid), "")
-            if m:
-                return m in _sel_members_num
-            return "(未分組)" in _sel_members_num
-
-        for force in res_eval['element_forces']:
-            if not _num_member_visible(force['element_id']):
-                continue
-            with st.expander(f"桿件 {force['element_id']} 內力圖表", expanded=True):
-                Le = force['Le']
-                x_vals = np.linspace(0, Le, 100)
-                # N, V2 為常數；M3 由 i 端線性插值至 j 端
-                N_vals  = np.full_like(x_vals, force['N'])
-                V2_vals = np.full_like(x_vals, force['V2'])
-                M3_vals = force['M3_i'] + (force['M3_j'] - force['M3_i']) * x_vals / Le
-
-                fig = make_subplots(rows=1, cols=3, subplot_titles=("軸力圖 (ND)", "剪力圖 (V2)", "彎矩圖 (M3)"))
-                for col_idx, (y_vals, title, color) in enumerate([
-                    (N_vals,  "Axial",  "blue"),
-                    (V2_vals, "Shear",  "blue"),
-                    (M3_vals, "Moment", "red"),
-                ], start=1):
-                    fig.add_trace(
-                        go.Scatter(x=x_vals, y=y_vals, name=title, fill='tozeroy',
-                                   line=dict(color=color)),
-                        row=1, col=col_idx
-                    )
-                fig.update_layout(height=400, showlegend=False, template="plotly_white")
-                fig.update_xaxes(title_text="Position (x)")
-                st.plotly_chart(fig, use_container_width=True, key=f"ifd_num_{force['element_id']}")
-
     if fast_btn:
         _group_vals = {
             sn: {"E": v["E"], "A": v["A"], "I": v["I33"], "G": v["G"]}
@@ -1947,81 +2005,6 @@ with right_panel:
                     st.error(f"分析時發生錯誤：{e}")
                     st.code(_tb.format_exc(), language="python")
                 st.stop()
-
-        # 新增：繪製內力圖 (ND, VD, MD)
-        st.divider()
-        st.subheader("內力分佈圖 (Internal Force Diagrams)")
-
-        _elem_member_map2 = {
-            _norm_id(e.get("id", 0)): str(e.get("member", "")).strip()
-            for e in st.session_state.get("elements_data", [])
-        }
-        _all_members2 = sorted({m for m in _elem_member_map2.values() if m})
-        _has_ungrouped_sym = any(m == "" for m in _elem_member_map2.values())
-        _member_opts_sym = _all_members2 + (["(未分組)"] if _has_ungrouped_sym else [])
-        if _member_opts_sym:
-            _sel_members_sym = st.multiselect(
-                "顯示構件群組", _member_opts_sym, default=_member_opts_sym,
-                key="ifd_member_filter_sym"
-            )
-        else:
-            _sel_members_sym = []
-
-        def _sym_member_visible(eid):
-            if not _member_opts_sym:
-                return True
-            m = _elem_member_map2.get(_norm_id(eid), "")
-            if m:
-                return m in _sel_members_sym
-            return "(未分組)" in _sel_members_sym
-
-        # 預先定義繪圖用的符號
-        x_sym = sp.Symbol('x')
-
-        for force in res_eval['element_forces']:
-            if not _sym_member_visible(force['element_id']):
-                continue
-            with st.expander(f"桿件 {force['element_id']} 內力圖表", expanded=True):
-                # 取得該桿件的實際長度
-                elem_id = force['element_id']
-                elem_raw = next((e for e in truss_data['elements'] if _norm_id(e['id']) == _norm_id(elem_id)), None)
-                if elem_raw is None:
-                    st.warning(f"找不到桿件 {elem_id}")
-                    continue
-                node_i = next((n for n in truss_data['nodes'] if _norm_id(str(n['id'])) == _norm_id(str(elem_raw['i']))), None)
-                node_j = next((n for n in truss_data['nodes'] if _norm_id(str(n['id'])) == _norm_id(str(elem_raw['j']))), None)
-                if node_i is None or node_j is None:
-                    st.warning(f"找不到桿件 {elem_id} 的端點節點")
-                    continue
-                actual_L = np.sqrt(
-                    (node_j['x']-node_i['x'])**2 +
-                    (node_j['y']-node_i['y'])**2 +
-                    (float(node_j.get('z', 0)) - float(node_i.get('z', 0)))**2
-                )
-
-                x_vals = np.linspace(0, actual_L, 100)
-                fig = make_subplots(rows=1, cols=3, subplot_titles=("軸力圖 (ND)", "剪力圖 (V2)", "彎矩圖 (M3)"))
-
-                for idx, (key, title) in enumerate([("N", "Axial"), ("V2", "Shear"), ("M3", "Moment")]):
-                    expr_str = force[key]['formula']
-                    try:
-                        expr = sp.parse_expr(expr_str.replace('^', '**'))
-                        f_np = sp.lambdify(x_sym, expr, modules=['numpy', {'Heaviside': lambda x: np.where(x >= 0, 1, 0)}])
-                        y_vals = f_np(x_vals)
-                        if isinstance(y_vals, (int, float, np.float64)):
-                            y_vals = np.full_like(x_vals, float(y_vals))
-                    except Exception as e:
-                        st.error(f"解析 {key} 失敗: {e}")
-                        y_vals = np.zeros_like(x_vals)
-
-                    fig.add_trace(
-                        go.Scatter(x=x_vals, y=y_vals, name=title, fill='tozeroy', line=dict(color='blue' if key != 'M3' else 'red')),
-                        row=1, col=idx+1
-                    )
-
-                fig.update_layout(height=400, showlegend=False, template="plotly_white")
-                fig.update_xaxes(title_text="Position (x)")
-                st.plotly_chart(fig, use_container_width=True, key=f"ifd_sym_{force['element_id']}")
 
     st.divider()
     st.subheader("結構預覽與分析圖形")
