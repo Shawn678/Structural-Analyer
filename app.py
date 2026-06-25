@@ -360,9 +360,9 @@ def _render_result_tabs(res_eval, truss_data):
                 "N (kN)":        _extract_val(ef.get("N", 0)) / 1000,
                 "V2 (kN)":       _extract_val(ef.get("V2", 0)) / 1000,
                 "V3 (kN)":       _extract_val(ef.get("V3", 0)) / 1000,
-                "M2_i (kN·m)":  _extract_val(ef.get("M2_i", 0)) / 1000,
+                "M2_i (kN·m)":  _extract_val(ef.get("M2_i") or ef.get("M2", 0)) / 1000,
                 "M2_j (kN·m)":  _extract_val(ef.get("M2_j", 0)) / 1000,
-                "M3_i (kN·m)":  _extract_val(ef.get("M3_i", 0)) / 1000,
+                "M3_i (kN·m)":  _extract_val(ef.get("M3_i") or ef.get("M3", 0)) / 1000,
                 "M3_j (kN·m)":  _extract_val(ef.get("M3_j", 0)) / 1000,
                 "Le (m)":        float(ef.get("Le", 0)),
             })
@@ -425,8 +425,8 @@ def _render_result_tabs(res_eval, truss_data):
                     rows=1, cols=3,
                     subplot_titles=("軸力圖 N (kN)", "剪力圖 V2 (kN)", "彎矩圖 M3 (kN·m)")
                 )
-                # 接縫位置（用於垂直虛線）
-                seam_xs = []
+                # 接縫位置（用於垂直虛線）及節點 ID
+                seam_info = []  # list of (x_pos, node_id_str)
                 x_global = 0.0
 
                 for seg_idx, ef in enumerate(mb_elems):
@@ -437,7 +437,13 @@ def _render_result_tabs(res_eval, truss_data):
 
                     # 收集接縫（除第一段起點外）
                     if seg_idx > 0:
-                        seam_xs.append(offset)
+                        _ef_raw = next(
+                            (e for e in truss_data.get("elements", [])
+                             if _norm_id(str(e.get("id", ""))) == _norm_id(str(ef["element_id"]))),
+                            {}
+                        )
+                        _seam_nid = str(_ef_raw.get("i", ""))
+                        seam_info.append((offset, _seam_nid))
 
                     # 取得各分量的 y 值
                     def _get_y(key):
@@ -491,13 +497,21 @@ def _render_result_tabs(res_eval, truss_data):
                             row=1, col=col_idx,
                         )
 
-                # 接縫垂直虛線（加在所有三個子圖）
-                for sx in seam_xs:
+                # 接縫垂直虛線（加在所有三個子圖）及節點 ID 標籤
+                for sx, snid in seam_info:
                     for col_idx in (1, 2, 3):
                         fig_t4.add_vline(
                             x=sx, line_dash="dot", line_color="gray", line_width=1,
                             row=1, col=col_idx,
                         )
+                    # 節點 ID 標籤僅加在第一個子圖（避免雜亂）
+                    fig_t4.add_annotation(
+                        x=sx, y=0, xref="x", yref="y",
+                        text=f"N{snid}", showarrow=False,
+                        font=dict(size=9, color="gray"),
+                        yanchor="bottom", xanchor="center",
+                        row=1, col=1,
+                    )
 
                 fig_t4.update_layout(
                     height=380, showlegend=False, template="plotly_white"

@@ -263,6 +263,9 @@ def evaluate_real_results(
             "nodes":      ef_sym["nodes"],
             "i_end":      ef_sym.get("i_end (N, V2, V3, T, M2, M3)", ""),
             "j_end":      ef_sym.get("j_end (N, V2, V3, T, M2, M3)", ""),
+            "Le":         ef_num.get("Le", 0.0),
+            "M3_j":       ef_num.get("M3_j", 0.0),
+            "M2_j":       ef_num.get("M2_j", 0.0),
         }
         for sym_key, out_key, num_key in [
             ("N(x)",  "N",  "N"),
