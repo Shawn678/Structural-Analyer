@@ -9,25 +9,39 @@ from core.symbolic import run_symbolic_analysis, run_numerical_analysis
 from core.materials import expand_truss_data, compute_self_weight
 
 
+def _norm_id(val) -> str:
+    s = str(val).strip()
+    try:
+        f = float(s)
+        if f == int(f):
+            return str(int(f))
+    except (ValueError, OverflowError):
+        pass
+    return s
+
+
 def build_geometry_fingerprint(truss_data: dict) -> dict:
     """計算幾何+支承指紋，不含材料參數與載重數值。"""
     node_id_to_pos = {
-        n["id"]: (float(n.get("x", 0)), float(n.get("y", 0)), float(n.get("z", 0)))
+        str(n["id"]): (float(n.get("x", 0)), float(n.get("y", 0)), float(n.get("z", 0)))
         for n in truss_data["nodes"]
     }
 
     elem_lengths = []
     connections = []
     for elem in truss_data["elements"]:
-        xi, yi, zi = node_id_to_pos[elem["i"]]
-        xj, yj, zj = node_id_to_pos[elem["j"]]
+        i_key, j_key = str(elem["i"]), str(elem["j"])
+        if i_key not in node_id_to_pos or j_key not in node_id_to_pos:
+            continue
+        xi, yi, zi = node_id_to_pos[i_key]
+        xj, yj, zj = node_id_to_pos[j_key]
         Le = math.sqrt((xj-xi)**2 + (yj-yi)**2 + (zj-zi)**2)
         elem_lengths.append(f"{Le:.6f}")
-        connections.append(f"{elem['i']}-{elem['j']}")
+        connections.append(f"{i_key}-{j_key}")
 
     CONSTRAINT_KEYS = ["kx", "ky", "kt", "rx", "ry", "rz", "ux", "uy", "uz"]
     supports_fp = []
-    for sup in sorted(truss_data.get("supports", []), key=lambda s: s["node_id"]):
+    for sup in sorted(truss_data.get("supports", []), key=lambda s: str(s["node_id"])):
         nid = sup["node_id"]
         active = []
         for k in CONSTRAINT_KEYS:
@@ -96,11 +110,14 @@ def evaluate_real_results(
         raw = run_symbolic_analysis(truss_data, section_group_map=section_group_map)
         elem_Ls = []
         # 從節點座標重建桿件長度（與 symbolic.py 的 elements_info 順序一致）
-        node_pos = {n["id"]: (float(n.get("x",0)), float(n.get("y",0)), float(n.get("z",0)))
+        node_pos = {_norm_id(n["id"]): (float(n.get("x",0)), float(n.get("y",0)), float(n.get("z",0)))
                     for n in truss_data["nodes"]}
         for elem in truss_data["elements"]:
-            xi, yi, zi = node_pos[elem["i"]]
-            xj, yj, zj = node_pos[elem["j"]]
+            i_key, j_key = _norm_id(elem["i"]), _norm_id(elem["j"])
+            if i_key not in node_pos or j_key not in node_pos:
+                continue
+            xi, yi, zi = node_pos[i_key]
+            xj, yj, zj = node_pos[j_key]
             elem_Ls.append(math.sqrt((xj-xi)**2+(yj-yi)**2+(zj-zi)**2))
         if symbolic_cache is not None:
             symbolic_cache["raw_result"] = raw

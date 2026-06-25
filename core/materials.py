@@ -2,6 +2,17 @@ import math
 import copy
 import numpy as np
 
+
+def _norm_id(val) -> str:
+    s = str(val).strip()
+    try:
+        f = float(s)
+        if f == int(f):
+            return str(int(f))
+    except (ValueError, OverflowError):
+        pass
+    return s
+
 # ── 截面幾何計算 ───────────────────────────────────────────────────────────
 
 def compute_section_props(shape: str, params: dict) -> dict:
@@ -212,9 +223,9 @@ def compute_self_weight(truss_data_expanded: dict, sections: list, materials: li
     """
     mat_map  = {m["name"]: m for m in materials}
     sec_map  = {s["name"]: s for s in sections}
-    node_pos = {int(n["id"]): np.array([float(n.get("x", 0)),
-                                         float(n.get("y", 0)),
-                                         float(n.get("z", 0))])
+    node_pos = {_norm_id(n["id"]): np.array([float(n.get("x", 0)),
+                                              float(n.get("y", 0)),
+                                              float(n.get("z", 0))])
                 for n in truss_data_expanded["nodes"]}
     gravity = np.array([0., 0., -1.])
 
@@ -231,7 +242,7 @@ def compute_self_weight(truss_data_expanded: dict, sections: list, materials: li
         if A_eff <= 0:
             continue
 
-        ni, nj = int(elem.get("i")), int(elem.get("j"))
+        ni, nj = _norm_id(elem.get("i")), _norm_id(elem.get("j"))
         if ni not in node_pos or nj not in node_pos:
             continue
 

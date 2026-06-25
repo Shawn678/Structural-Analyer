@@ -2,6 +2,17 @@ import numpy as np
 
 NDOF = 6
 
+
+def _norm_id(val) -> str:
+    s = str(val).strip()
+    try:
+        f = float(s)
+        if f == int(f):
+            return str(int(f))
+    except (ValueError, OverflowError):
+        pass
+    return s
+
 def _build_T_rigid(d: np.ndarray) -> np.ndarray:
     """
     建立 6×6 剛體轉換矩陣 T，使得 u_slave = T @ u_master。
@@ -37,15 +48,20 @@ def apply_rigid_links(
     if not rigid_links:
         return K.copy(), F.copy(), {}
 
-    node_id_to_idx = {str(n['id']): i for i, n in enumerate(nodes)}
+    # master==slave 的 RL 無效，過濾掉
+    rigid_links = [rl for rl in rigid_links if _norm_id(rl['master']) != _norm_id(rl['slave'])]
+    if not rigid_links:
+        return K.copy(), F.copy(), {}
+
+    node_id_to_idx = {_norm_id(n['id']): i for i, n in enumerate(nodes)}
     n_total = K.shape[0]
 
     slave_dof_starts = set()
     slave_info = {}
 
     for rl in rigid_links:
-        m_id = str(rl['master'])
-        s_id = str(rl['slave'])
+        m_id = _norm_id(rl['master'])
+        s_id = _norm_id(rl['slave'])
         if m_id not in node_id_to_idx or s_id not in node_id_to_idx:
             continue
         mi = node_id_to_idx[m_id]
@@ -108,11 +124,11 @@ def recover_slave_displacements(
     從已求解的全尺寸位移向量反推各 slave 節點位移。
     回傳：{slave_node_id: np.ndarray(6)}
     """
-    node_id_to_idx = {str(n['id']): i for i, n in enumerate(nodes)}
+    node_id_to_idx = {_norm_id(n['id']): i for i, n in enumerate(nodes)}
     result = {}
-    for rl in rigid_links:
-        m_id = str(rl['master'])
-        s_id = str(rl['slave'])
+    for rl in [r for r in rigid_links if _norm_id(r['master']) != _norm_id(r['slave'])]:
+        m_id = _norm_id(rl['master'])
+        s_id = _norm_id(rl['slave'])
         if m_id not in node_id_to_idx or s_id not in node_id_to_idx:
             continue
         mi = node_id_to_idx[m_id]

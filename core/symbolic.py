@@ -4,6 +4,18 @@ import numpy as np
 import time
 from core.rigid_link import apply_rigid_links, recover_slave_displacements
 
+def _norm_id(val) -> str:
+    """統一節點/桿件 ID 為字串：1.0 → '1'，'1.0' → '1'，'gen_...' → 'gen_...'"""
+    s = str(val).strip()
+    try:
+        f = float(s)
+        if f == int(f):
+            return str(int(f))
+    except (ValueError, OverflowError):
+        pass
+    return s
+
+
 def _to_sym(val, default=0):
     """安全地將輸入轉換為 SymPy 數值，處理 None, NaN 或空字串。"""
     if val is None:
@@ -59,7 +71,7 @@ def _assemble_K_np(truss_data, E_s, A_s, I_s, G_s):
     """用指定材料參數組裝全域剛度矩陣，回傳 (K_np, elements_info, nodes_coords, free_dofs)。"""
     node_list      = truss_data['nodes']
     n_nodes        = len(node_list)
-    node_id_to_idx = {n['id']: i for i, n in enumerate(node_list)}
+    node_id_to_idx = {_norm_id(n['id']): i for i, n in enumerate(node_list)}
     nodes_coords   = [
         (_to_float(n.get('x', 0)),
          _to_float(n.get('y', 0)),
@@ -72,8 +84,8 @@ def _assemble_K_np(truss_data, E_s, A_s, I_s, G_s):
     elements_info = []
 
     for elem in truss_data['elements']:
-        ni = node_id_to_idx[elem['i']]
-        nj = node_id_to_idx[elem['j']]
+        ni = node_id_to_idx[_norm_id(elem['i'])]
+        nj = node_id_to_idx[_norm_id(elem['j'])]
         xi, yi, zi = nodes_coords[ni]
         xj, yj, zj = nodes_coords[nj]
         dx, dy, dz = xj - xi, yj - yi, zj - zi
@@ -157,9 +169,9 @@ def _assemble_K_np(truss_data, E_s, A_s, I_s, G_s):
 
     # 彈簧支承
     for sup in truss_data['supports']:
-        if sup.get('node_id') not in node_id_to_idx:
+        if _norm_id(sup.get('node_id')) not in node_id_to_idx:
             continue
-        idx = node_id_to_idx[sup['node_id']]
+        idx = node_id_to_idx[_norm_id(sup['node_id'])]
         for key, dof_off in [('kx', 0), ('ky', 1), ('kt', 5)]:
             val = sup.get(key, 0)
             try:
@@ -183,9 +195,9 @@ def _assemble_K_np(truss_data, E_s, A_s, I_s, G_s):
             fixed_dofs.update({NDOF*idx+1, NDOF*idx+3, NDOF*idx+5})
 
     for sup in truss_data['supports']:
-        if sup.get('node_id') not in node_id_to_idx:
+        if _norm_id(sup.get('node_id')) not in node_id_to_idx:
             continue
-        idx = node_id_to_idx[sup['node_id']]
+        idx = node_id_to_idx[_norm_id(sup['node_id'])]
         if sup.get('ux',    False): fixed_dofs.add(NDOF*idx+0)
         if sup.get('uy',    False): fixed_dofs.add(NDOF*idx+1)
         if sup.get('uz',    False): fixed_dofs.add(NDOF*idx+2)
@@ -349,8 +361,8 @@ def run_symbolic_analysis(truss_data: dict, section_group_map: dict | None = Non
 
     node_list      = truss_data['nodes']
     n_nodes        = len(node_list)
-    node_id_to_idx = {n['id']: i for i, n in enumerate(node_list)}
-    idx_to_node_id = {i: n['id'] for i, n in enumerate(node_list)}
+    node_id_to_idx = {_norm_id(n['id']): i for i, n in enumerate(node_list)}
+    idx_to_node_id = {i: _norm_id(n['id']) for i, n in enumerate(node_list)}
     NDOF           = 6
     total_dof      = NDOF * n_nodes
 
@@ -365,8 +377,9 @@ def run_symbolic_analysis(truss_data: dict, section_group_map: dict | None = Non
     )
 
     # ── Rigid Link 前處理 ─────────────────────────────────────────────────
-    rigid_links = truss_data.get('rigid_links', [])
-    slave_node_ids = {str(rl['slave']) for rl in rigid_links}
+    rigid_links = [rl for rl in truss_data.get('rigid_links', [])
+                   if _norm_id(rl.get('master','')) != _norm_id(rl.get('slave',''))]
+    slave_node_ids = {_norm_id(rl['slave']) for rl in rigid_links}
     slave_node_idxs = {node_id_to_idx[sid] for sid in slave_node_ids if sid in node_id_to_idx}
     slave_dofs_set = {idx * NDOF + k for idx in slave_node_idxs for k in range(NDOF)}
 
@@ -436,9 +449,12 @@ def run_symbolic_analysis(truss_data: dict, section_group_map: dict | None = Non
     # ── 載重向量（僅用基準材料參數建立，含 P, w 符號）────────────────────
     F_global = sp.zeros(total_dof, 1)
 
-    for e_load in truss_data.get('element_loads', []):
-        info = next((e for e in elements_info if e['id'] == e_load['element_id']), None)
+    _eloads = truss_data.get('element_loads', [])
+    print(f"[LOAD CHECK] element_loads 筆數={len(_eloads)}, 前3筆={_eloads[:3]}")
+    for e_load in _eloads:
+        info = next((e for e in elements_info if _norm_id(e['id']) == _norm_id(e_load['element_id'])), None)
         if not info:
+            print(f"[LOAD MISS] element_load id={e_load['element_id']} 找不到對應桿件")
             continue
         Le_n     = info['Le']
         load_val = _to_sym(e_load.get('w', 0)) * w_sym
@@ -457,7 +473,7 @@ def run_symbolic_analysis(truss_data: dict, section_group_map: dict | None = Non
             F_global[dof, 0] -= f_fg[i]
 
     for p_load in truss_data.get('element_point_loads', []):
-        info = next((e for e in elements_info if e['id'] == p_load['element_id']), None)
+        info = next((e for e in elements_info if _norm_id(e['id']) == _norm_id(p_load['element_id'])), None)
         if not info:
             continue
         Le_n  = info['Le']
@@ -485,9 +501,9 @@ def run_symbolic_analysis(truss_data: dict, section_group_map: dict | None = Non
             F_global[dof, 0] -= f_fg[i]
 
     for load in truss_data['loads']:
-        if load.get('node_id') not in node_id_to_idx:
+        if _norm_id(load.get('node_id')) not in node_id_to_idx:
             continue
-        idx = node_id_to_idx[load['node_id']]
+        idx = node_id_to_idx[_norm_id(load['node_id'])]
         F_global[NDOF*idx+0, 0] += _to_sym(load.get('fx', 0)) * P_sym
         F_global[NDOF*idx+1, 0] += _to_sym(load.get('fy', 0)) * P_sym
         F_global[NDOF*idx+2, 0] += _to_sym(load.get('fz', 0)) * P_sym
@@ -640,6 +656,8 @@ def run_symbolic_analysis(truss_data: dict, section_group_map: dict | None = Non
             f"採樣 {s_idx}: free_dof 集合在縮放下改變，請檢查結構輸入"
 
         # 若有 rigid link，先凝縮 K_s；否則直接切 submatrix
+        if s_idx == 0:
+            print(f"[SAMPLE0] free_dofs={len(free_dofs)}, master_free_cols={len(master_free_cols)}, F_P_np_free max={np.max(np.abs(F_P_np_free)):.3e}, F_w_np_free max={np.max(np.abs(F_w_np_free)):.3e}, has_P={has_P_load}, has_w={has_w_load}")
         if rigid_links:
             F_zero_s = np.zeros(total_dof)
             K_cond_s, _, _ = apply_rigid_links(K_s, F_zero_s, node_list, rigid_links)
@@ -650,25 +668,67 @@ def run_symbolic_analysis(truss_data: dict, section_group_map: dict | None = Non
         F_P_s = F_P_np_free
         F_w_s = F_w_np_free
 
-        U_P_s = np.linalg.solve(K_red, F_P_s) if has_P_load else np.zeros(len(free_dofs))
-        U_w_s = np.linalg.solve(K_red, F_w_s) if has_w_load else np.zeros(len(free_dofs))
+        if has_P_load or has_w_load:
+            _diag = np.diag(K_red)
+            _diag_max = np.max(np.abs(_diag)) if len(_diag) > 0 else 1.0
+            _threshold = _diag_max * 1e-10
+            _zero_rows = np.where(np.abs(_diag) < _threshold)[0]
+            if len(_zero_rows) > 0:
+                _zero_node_info = []
+                for _zr in _zero_rows[:20]:
+                    _orig_dof = all_dofs_no_slave[master_free_cols[_zr]] if _zr < len(master_free_cols) else _zr
+                    _nidx = _orig_dof // 6
+                    _dof_name = ['ux','uy','uz','rx','ry','rz'][_orig_dof % 6]
+                    _nid = idx_to_node_id.get(_nidx, f'idx{_nidx}')
+                    _zero_node_info.append(f"node={_nid} dof={_dof_name} diag={_diag[_zr]:.3e}")
+                print(f"[SINGULAR] 相對零對角線 (閾值={_threshold:.2e}): {_zero_node_info}")
+            # 特徵值分析找機構方向
+            try:
+                _eigvals = np.linalg.eigvalsh(K_red)
+                _neg_or_zero = _eigvals[_eigvals < _diag_max * 1e-8]
+                if len(_neg_or_zero) > 0:
+                    print(f"[SINGULAR] K_red 最小特徵值前10: {_eigvals[:10]}")
+                    # 找最小特徵值對應的特徵向量，反查是哪些 DOF
+                    _eigvals2, _eigvecs = np.linalg.eigh(K_red)
+                    for _ev_idx in range(min(3, len(_eigvals2))):
+                        if abs(_eigvals2[_ev_idx]) < _diag_max * 1e-8:
+                            _vec = _eigvecs[:, _ev_idx]
+                            _top_cols = np.argsort(np.abs(_vec))[::-1][:5]
+                            _top_dofs = []
+                            for _c in _top_cols:
+                                _orig = all_dofs_no_slave[master_free_cols[_c]] if _c < len(master_free_cols) else _c
+                                _ni = _orig // 6
+                                _dn = ['ux','uy','uz','rx','ry','rz'][_orig % 6]
+                                _top_dofs.append(f"{idx_to_node_id.get(_ni, f'idx{_ni}')}.{_dn}({_vec[_c]:.2f})")
+                            print(f"[SINGULAR] 機構模態 λ={_eigvals2[_ev_idx]:.3e}: {_top_dofs}")
+            except Exception as _e:
+                print(f"[SINGULAR] 特徵值分析失敗: {_e}")
+        _n_mfc = len(master_free_cols)
+        U_P_s = np.linalg.solve(K_red, F_P_s) if has_P_load else np.zeros(_n_mfc)
+        U_w_s = np.linalg.solve(K_red, F_w_s) if has_w_load else np.zeros(_n_mfc)
 
-        # 展開至全域 DOF（slave DOF 位置保留為 0；後續反推）
+        # 展開至全域 DOF（用 all_dofs_no_slave[master_free_cols] 對應回全域 DOF）
         U_P_full_s = np.zeros(total_dof)
         U_w_full_s = np.zeros(total_dof)
-        for i, d in enumerate(free_dofs):
+        for i, col in enumerate(master_free_cols):
+            d = all_dofs_no_slave[col]
             samples_P_full[s_idx, d] = U_P_s[i]
             samples_w_full[s_idx, d] = U_w_s[i]
             U_P_full_s[d] = U_P_s[i]
             U_w_full_s[d] = U_w_s[i]
 
-        # 採樣反力 R = K_fx_fr @ U_free - F_fixed
+        # 採樣反力：用凝縮後 K_cond_s
+        # fixed_cols_no_slave：all_dofs_no_slave 中對應固定 DOF 的位置索引
         if _n_fixed > 0:
-            K_fx_fr_s = K_s[np.ix_(fixed_dofs_list, free_dofs)]
-            F_P_fixed = np.array([float(F_P_sym[d, 0].subs(P_sym, 1)) for d in fixed_dofs_list])
-            F_w_fixed = np.array([float(F_w_sym[d, 0].subs(w_sym, 1)) for d in fixed_dofs_list])
-            samples_react_P[s_idx] = K_fx_fr_s @ U_P_s - F_P_fixed
-            samples_react_w[s_idx] = K_fx_fr_s @ U_w_s - F_w_fixed
+            _free_set = set(free_dofs)
+            _fixed_cols_cond = [i for i, d in enumerate(all_dofs_no_slave) if d not in _free_set and d not in slave_dofs_set]
+            _fixed_global_dofs = [all_dofs_no_slave[i] for i in _fixed_cols_cond]
+            if _fixed_cols_cond:
+                K_fx_fr_s = K_cond_s[np.ix_(_fixed_cols_cond, master_free_cols)]
+                F_P_fixed = np.array([float(F_P_sym[d, 0].subs(P_sym, 1)) for d in _fixed_global_dofs])
+                F_w_fixed = np.array([float(F_w_sym[d, 0].subs(w_sym, 1)) for d in _fixed_global_dofs])
+                samples_react_P[s_idx] = K_fx_fr_s @ U_P_s - F_P_fixed
+                samples_react_w[s_idx] = K_fx_fr_s @ U_w_s - F_w_fixed
 
         # 採樣桿件端力（使用當次採樣的 elements_info）
         _elems_for_ef = elems_s if (_n_groups > 0 or per_elem_E is not None) else elements_info
@@ -880,7 +940,7 @@ def run_symbolic_analysis(truss_data: dict, section_group_map: dict | None = Non
 
     support_reactions = []
     for sup in truss_data['supports']:
-        node_id = sup['node_id']
+        node_id = _norm_id(sup['node_id'])
         if node_id not in node_id_to_idx:
             continue
         idx = node_id_to_idx[node_id]
@@ -959,8 +1019,8 @@ def run_numerical_analysis(truss_data: dict) -> dict:
     """
     node_list      = truss_data['nodes']
     n_nodes        = len(node_list)
-    node_id_to_idx = {n['id']: i for i, n in enumerate(node_list)}
-    idx_to_node_id = {i: n['id'] for i, n in enumerate(node_list)}
+    node_id_to_idx = {_norm_id(n['id']): i for i, n in enumerate(node_list)}
+    idx_to_node_id = {i: _norm_id(n['id']) for i, n in enumerate(node_list)}
     NDOF           = 6
     total_dof      = NDOF * n_nodes
 
@@ -978,7 +1038,7 @@ def run_numerical_analysis(truss_data: dict) -> dict:
     # 桿件均佈載重
     f_fixed_local = {info['id']: np.zeros(12) for info in elements_info}
     for e_load in truss_data.get('element_loads', []):
-        info = next((e for e in elements_info if e['id'] == e_load['element_id']), None)
+        info = next((e for e in elements_info if _norm_id(e['id']) == _norm_id(e_load['element_id'])), None)
         if not info:
             continue
         Le_n = info['Le']
@@ -996,7 +1056,7 @@ def run_numerical_analysis(truss_data: dict) -> dict:
 
     # 桿件集中載重
     for p_load in truss_data.get('element_point_loads', []):
-        info = next((e for e in elements_info if e['id'] == p_load['element_id']), None)
+        info = next((e for e in elements_info if _norm_id(e['id']) == _norm_id(p_load['element_id'])), None)
         if not info:
             continue
         Le_n  = info['Le']
@@ -1022,9 +1082,9 @@ def run_numerical_analysis(truss_data: dict) -> dict:
 
     # 節點集中載重
     for load in truss_data['loads']:
-        if load.get('node_id') not in node_id_to_idx:
+        if _norm_id(load.get('node_id')) not in node_id_to_idx:
             continue
-        idx = node_id_to_idx[load['node_id']]
+        idx = node_id_to_idx[_norm_id(load['node_id'])]
         F_np[NDOF*idx+0] += _to_float(load.get('fx', 0))
         F_np[NDOF*idx+1] += _to_float(load.get('fy', 0))
         F_np[NDOF*idx+2] += _to_float(load.get('fz', 0))
@@ -1032,14 +1092,42 @@ def run_numerical_analysis(truss_data: dict) -> dict:
         F_np[NDOF*idx+4] += _to_float(load.get('my', 0))
         F_np[NDOF*idx+5] += _to_float(load.get('mz', 0))
 
-    # ── 求解自由度位移 ─────────────────────────────────────────────────────
-    K_red = K_np[np.ix_(free_dofs, free_dofs)]
-    F_red = F_np[free_dofs]
-    U_full = np.zeros(total_dof)
-    if len(free_dofs) > 0 and np.any(np.abs(F_red) > 1e-30):
-        U_red = np.linalg.solve(K_red, F_red)
-        for i, d in enumerate(free_dofs):
-            U_full[d] = U_red[i]
+    # ── Rigid Link 凝縮後求解 ──────────────────────────────────────────────
+    _rl_num = [rl for rl in truss_data.get('rigid_links', [])
+               if _norm_id(rl.get('master', '')) != _norm_id(rl.get('slave', ''))]
+    if _rl_num:
+        # slave DOF 排除出自由度
+        _slave_ids = {_norm_id(rl['slave']) for rl in _rl_num}
+        _slave_idxs = {node_id_to_idx[s] for s in _slave_ids if s in node_id_to_idx}
+        _slave_dofs = {idx * NDOF + k for idx in _slave_idxs for k in range(NDOF)}
+        free_dofs_no_slave = [d for d in free_dofs if d not in _slave_dofs]
+        # 凝縮
+        K_cond, F_cond, _slave_info = apply_rigid_links(K_np, F_np, node_list, _rl_num)
+        # all_dofs_no_slave 索引
+        _all_no_slave = [d for d in range(total_dof) if d not in _slave_dofs]
+        _free_cols = [_all_no_slave.index(d) for d in free_dofs_no_slave]
+        K_red = K_cond[np.ix_(_free_cols, _free_cols)]
+        F_red = F_cond[_free_cols]
+        print(f"[NUM] free_dofs_no_slave={len(free_dofs_no_slave)}, F_red max={np.max(np.abs(F_red)):.3e}, F_np max={np.max(np.abs(F_np)):.3e}")
+        U_full = np.zeros(total_dof)
+        if len(free_dofs_no_slave) > 0 and np.any(np.abs(F_red) > 1e-30):
+            U_red = np.linalg.solve(K_red, F_red)
+            for i, d in enumerate(free_dofs_no_slave):
+                U_full[d] = U_red[i]
+        # 還原 slave 節點位移
+        _slave_disps = recover_slave_displacements(U_full, node_list, _rl_num)
+        for _sid, _uv in _slave_disps.items():
+            if _sid in node_id_to_idx:
+                _si = node_id_to_idx[_sid]
+                U_full[_si*NDOF:_si*NDOF+NDOF] = _uv
+    else:
+        K_red = K_np[np.ix_(free_dofs, free_dofs)]
+        F_red = F_np[free_dofs]
+        U_full = np.zeros(total_dof)
+        if len(free_dofs) > 0 and np.any(np.abs(F_red) > 1e-30):
+            U_red = np.linalg.solve(K_red, F_red)
+            for i, d in enumerate(free_dofs):
+                U_full[d] = U_red[i]
 
     # ── 節點位移輸出 ───────────────────────────────────────────────────────
     node_displacements = []
@@ -1102,7 +1190,24 @@ def run_numerical_analysis(truss_data: dict) -> dict:
 
     # ── 支承反力輸出 ───────────────────────────────────────────────────────
     support_reactions = []
-    if fixed_dofs_list:
+    if _rl_num:
+        # RL 凝縮後的反力：用 K_cond / F_cond，固定 DOF = all_no_slave 中排除 free_no_slave
+        _fixed_no_slave = [d for d in _all_no_slave if d not in set(free_dofs_no_slave)]
+        if _fixed_no_slave:
+            K_fx_fr = K_cond[np.ix_(_fixed_no_slave, _free_cols)]
+            R_fixed_vals = K_fx_fr @ U_full[free_dofs_no_slave] - F_cond[_fixed_no_slave]
+            for ii, dof_idx in enumerate(_fixed_no_slave):
+                node_idx = dof_idx // NDOF
+                nid      = idx_to_node_id[node_idx]
+                dof_off  = dof_idx % NDOF
+                keys = ["Rx", "Ry", "Rz", "Mx", "My", "Mz"]
+                entry = next((r for r in support_reactions if r["node_id"] == nid), None)
+                if entry is None:
+                    entry = {"node_id": nid, "Rx": 0.0, "Ry": 0.0, "Rz": 0.0,
+                             "Mx": 0.0, "My": 0.0, "Mz": 0.0}
+                    support_reactions.append(entry)
+                entry[keys[dof_off]] = float(R_fixed_vals[ii])
+    elif fixed_dofs_list:
         K_fx_fr = K_np[np.ix_(fixed_dofs_list, free_dofs)]
         R_fixed = K_fx_fr @ U_full[free_dofs] - F_np[fixed_dofs_list]
         for ii, dof_idx in enumerate(fixed_dofs_list):
@@ -1110,7 +1215,6 @@ def run_numerical_analysis(truss_data: dict) -> dict:
             nid      = idx_to_node_id[node_idx]
             dof_off  = dof_idx % NDOF
             keys = ["Rx", "Ry", "Rz", "Mx", "My", "Mz"]
-            # 找或建立該節點的 entry
             entry = next((r for r in support_reactions if r["node_id"] == nid), None)
             if entry is None:
                 entry = {"node_id": nid, "Rx": 0.0, "Ry": 0.0, "Rz": 0.0,
