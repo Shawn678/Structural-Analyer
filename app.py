@@ -177,6 +177,16 @@ def _project_outline(pts2d, cx, cy, cz, ey, ez):
     return xs, ys, zs
 
 
+def _extract_val(v):
+    """從符號解 dict {"value": x} 或純數值中取出 float。"""
+    if isinstance(v, dict):
+        return float(v.get("value", 0.0))
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return 0.0
+
+
 def create_structure_plot(nodes_df, elements_df, supports_df=None, reactions=None, rigid_links=None):
     fig = go.Figure()
 
@@ -690,9 +700,11 @@ with left_panel:
 
     st.subheader("載重 (Loads)")
     st.caption("fx / fy / fz：**N（牛頓）**；mx / my / mz：**N·m（牛頓·公尺）**")
-    _loads_default = st.session_state.pop("_loaded_loads", None) or [
-        {"node_id": "", "fx": 0.0, "fy": 0.0, "fz": 0.0}
-    ]
+    _loads_default = (
+        st.session_state.pop("_loaded_loads", None)
+        or st.session_state.get("_pt_accumulated_loads")
+        or [{"node_id": "", "fx": 0.0, "fy": 0.0, "fz": 0.0}]
+    )
     _loads_df_raw = pd.DataFrame(_loads_default)
     if "node_id" in _loads_df_raw.columns:
         _loads_df_raw["node_id"] = _loads_df_raw["node_id"].astype(str).str.replace(r"^(nan|None)$", "", regex=True)
@@ -920,13 +932,21 @@ with left_panel:
                 st.rerun()
 
     # ── 索力初始設定 ─────────────────────────────────────────────────────────
-    with st.expander("⚙️ 索力初始設定 Cable Pretension", expanded=False):
+    # checkbox 必須在 expander 之前渲染，否則同一 run 內 expander 讀不到勾選值
+    include_sw = st.checkbox("含自重（Self-Weight）", value=False, key="include_sw")
+
+    with st.expander("⚙️ 索力初始設定 Cable Pretension",
+                     expanded=st.session_state.get("_pt_expander_open", False)):
         from core.cable_wizard import compute_cable_pretension_guess
 
         st.caption(
             "基於主梁標稱彎矩容量，自動計算初始索力猜測值。"
             "計算採三彎矩方程（假設 EI 均一），結果作為設計起點，請依彎矩圖微調。"
         )
+
+        _pt_apply_msg = st.session_state.pop("_pt_apply_msg", "")
+        if _pt_apply_msg:
+            st.success(_pt_apply_msg)
 
         # 蒐集所有索群組（pin_i=True 且 pin_j=True 且有 group 標籤）
         _pt_cable_elems = [
@@ -982,13 +1002,25 @@ with left_panel:
                     if sn:
                         _pt_support_xs.append(float(sn.get("x", 0)))
 
+            # 主梁 member 選單（與 Cable Face Wizard 邏輯一致）
+            _pt_all_members = sorted({
+                str(e.get("member", "")) for e in st.session_state.get("elements_data", [])
+                if isinstance(e.get("member"), str) and e.get("member", "").strip()
+                and not e.get("pin_i") and not e.get("pin_j")
+            })
+            _pt_beam_member = st.selectbox(
+                "主梁 member 名稱",
+                options=[""] + _pt_all_members,
+                key="pt_beam_member",
+                help="選擇主梁所屬的構件群組名稱，用於自動估算線重（與 Cable Face Wizard 的主梁 member 相同）",
+            )
+
             # 估算主梁線重（從 compute_self_weight 結果，或 fallback 手動輸入）
             _sw_available = False
             _pt_w_auto = 0.0
-            if st.session_state.get("include_sw") and st.session_state.get("sections"):
+            if st.session_state.get("include_sw") and st.session_state.get("sections") and _pt_beam_member:
                 try:
                     from core.materials import compute_self_weight, expand_truss_data
-                    import copy as _pt_copy
                     _td_sw = expand_truss_data(
                         {
                             "nodes": nodes_df.dropna(subset=["id"]).fillna(0).to_dict("records"),
@@ -999,13 +1031,12 @@ with left_panel:
                         st.session_state["sections"],
                     )
                     _sw_res = compute_self_weight(_td_sw, st.session_state["sections"], st.session_state["materials"])
-                    # 只取主梁桿件（有 section 的非索桿件）的 w，加權平均
                     _sw_items = _sw_res.get("element_loads", [])
-                    _sw_elem_map = {int(x["element_id"]): float(x.get("w", 0)) for x in _sw_items}
+                    _sw_elem_map = {_norm_id(x["element_id"]): float(x.get("w", 0)) for x in _sw_items}
                     _main_ws, _main_lens = [], []
                     for _, row in elements_df.iterrows():
                         eid = row.get("id")
-                        if not row.get("section") or row.get("pin_i") or row.get("pin_j"):
+                        if str(row.get("member", "")).strip() != _pt_beam_member:
                             continue
                         if _norm_id(eid) not in _sw_elem_map:
                             continue
@@ -1023,10 +1054,13 @@ with left_panel:
                     pass
 
             if _sw_available:
-                st.success(f"主梁等效線重（自重）：{_pt_w_auto/1000:.2f} kN/m（自動估算）")
+                st.success(f"主梁等效線重（自重）：{_pt_w_auto/1000:.2f} kN/m（自動估算，member='{_pt_beam_member}'）")
                 _pt_w = _pt_w_auto
             else:
-                st.warning("未偵測到自重資料。請勾選「含自重」並設定截面密度，或手動輸入主梁線重。")
+                if st.session_state.get("include_sw") and _pt_beam_member:
+                    st.warning(f"member='{_pt_beam_member}' 未取得自重資料，請確認截面已設定密度。")
+                else:
+                    st.warning("請勾選「含自重」並選擇主梁 member，或手動輸入主梁線重。")
                 _pt_w_input = st.number_input(
                     "主梁線重 w（kN/m，向下）", min_value=0.0, value=50.0,
                     format="%.1f", key="pt_w_manual"
@@ -1145,9 +1179,12 @@ with left_panel:
 
                     # 套用按鈕
                     if st.button("套用索力到載重表", key=f"pt_apply_{_pt_sel_grp}", type="primary"):
-                        _loads_list = st.session_state.get("loads", [])
-                        _loads_map  = {str(int(float(ld["node_id"]))): dict(ld)
-                                       for ld in _loads_list if ld.get("node_id") is not None}
+                        # 以累積載重為基底，再疊加本群組的錨點力
+                        _loads_map = {
+                            _norm_id(ld["node_id"]): dict(ld)
+                            for ld in (st.session_state.get("_pt_accumulated_loads") or [])
+                            if str(ld.get("node_id", "")).strip() not in ("", "nan", "None")
+                        }
 
                         _applied_eids = []
                         _final_forces_kN = []
@@ -1162,7 +1199,7 @@ with left_panel:
                             anid = _anchor_nids[idx] if idx < len(_anchor_nids) else None
                             if anid is None:
                                 continue
-                            anid_key = str(int(float(anid))) if anid else anid
+                            anid_key = _norm_id(anid)
                             if anid_key in _loads_map:
                                 _loads_map[anid_key]["fz"] = final_fz
                             else:
@@ -1170,18 +1207,24 @@ with left_panel:
                             _applied_eids.append(eid)
                             _final_forces_kN.append(final_fz / 1000.0)
 
-                        # 強制刷新 loads data_editor（_loaded_loads 在下一輪 render 會被 pop 出來）
-                        st.session_state["_loaded_loads"] = list(_loads_map.values())
-
-                        if _final_forces_kN:
-                            st.success(
-                                f"已套用 {len(_applied_eids)} 根索｜"
-                                f"最大 {max(_final_forces_kN):.2f} kN｜"
-                                f"最小 {min(_final_forces_kN):.2f} kN"
-                            )
+                        # 合併現有載重表（保留其他群組已套用的資料）再覆蓋本群組錨點
+                        _existing_loads = {
+                            _norm_id(ld["node_id"]): dict(ld)
+                            for ld in (st.session_state.get("_pt_accumulated_loads") or [])
+                            if str(ld.get("node_id", "")).strip() not in ("", "nan", "None")
+                        }
+                        _existing_loads.update(_loads_map)
+                        st.session_state["_pt_accumulated_loads"] = list(_existing_loads.values())
+                        st.session_state.pop("loads", None)
+                        st.session_state["_loaded_loads"] = list(_existing_loads.values())
+                        st.session_state["_pt_expander_open"] = True
+                        st.session_state["_pt_apply_msg"] = (
+                            f"已套用 {len(_applied_eids)} 根索｜"
+                            f"最大 {max(_final_forces_kN):.2f} kN｜"
+                            f"最小 {min(_final_forces_kN):.2f} kN"
+                        ) if _final_forces_kN else ""
                         st.rerun()
 
-    include_sw = st.checkbox("含自重（Self-Weight）", value=False, key="include_sw")
     run_btn = st.button("執行分析（符號解）", type="primary", use_container_width=True)
     num_btn = st.button("執行數值分析（直接代入）", use_container_width=True)
 
