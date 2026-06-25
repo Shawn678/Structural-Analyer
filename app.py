@@ -278,6 +278,79 @@ def _sort_member_elements(elem_forces, truss_data):
     return result
 
 
+def _render_result_tabs(res_eval, truss_data):
+    tab1, tab2, tab3, tab4 = st.tabs(["📐 節點位移", "⬆️ 支承反力", "📊 桿件內力摘要", "📈 內力圖"])
+
+    # ── Tab 1：節點位移 ─────────────────────────────────────────────────
+    with tab1:
+        disp_rows = []
+        for nd in res_eval.get("node_displacements", []):
+            disp_rows.append({
+                "節點 ID": nd["node_id"],
+                "ux (m)":      _extract_val(nd.get("ux", 0)),
+                "uy (m)":      _extract_val(nd.get("uy", 0)),
+                "uz (m)":      _extract_val(nd.get("uz", 0)),
+                "rx (rad)": _extract_val(nd.get("theta_x", 0)),
+                "ry (rad)": _extract_val(nd.get("theta_y", 0)),
+                "rz (rad)": _extract_val(nd.get("theta_z", 0)),
+            })
+        disp_df = pd.DataFrame(disp_rows)
+        if not disp_df.empty:
+            all_nids = [str(r) for r in disp_df["節點 ID"]]
+            sel_nids = st.multiselect("篩選節點 ID", all_nids, default=all_nids, key="tab1_node_filter")
+            filtered = disp_df[disp_df["節點 ID"].astype(str).isin(sel_nids)] if sel_nids else disp_df
+            # 摘要
+            max_uz_row = disp_df.loc[disp_df["uz (m)"].abs().idxmax()]
+            st.caption(
+                f"最大垂直位移 |uz| = {abs(max_uz_row['uz (m)'])*1000:.3f} mm（節點 {max_uz_row['節點 ID']}）"
+            )
+            st.dataframe(
+                filtered.style.format({
+                    "ux (m)": "{:.4e}", "uy (m)": "{:.4e}", "uz (m)": "{:.4e}",
+                    "rx (rad)": "{:.4e}", "ry (rad)": "{:.4e}", "rz (rad)": "{:.4e}",
+                }),
+                use_container_width=True, hide_index=True,
+            )
+        else:
+            st.info("無位移資料。")
+
+    # ── Tab 2：支承反力 ─────────────────────────────────────────────────
+    with tab2:
+        react_rows = []
+        for sr in res_eval.get("support_reactions", []):
+            react_rows.append({
+                "節點 ID": sr["node_id"],
+                "Fx (N)":   _extract_val(sr.get("Rx", 0)),
+                "Fy (N)":   _extract_val(sr.get("Ry", 0)),
+                "Fz (N)":   _extract_val(sr.get("Rz", 0)),
+                "Mx (N·m)": _extract_val(sr.get("Mx", 0)),
+                "My (N·m)": _extract_val(sr.get("My", 0)),
+                "Mz (N·m)": _extract_val(sr.get("Mz", 0)),
+            })
+        react_df = pd.DataFrame(react_rows)
+        if not react_df.empty:
+            all_rnids = [str(r) for r in react_df["節點 ID"]]
+            sel_rnids = st.multiselect("篩選節點 ID", all_rnids, default=all_rnids, key="tab2_node_filter")
+            filtered_r = react_df[react_df["節點 ID"].astype(str).isin(sel_rnids)] if sel_rnids else react_df
+            total_fz = react_df["Fz (N)"].sum()
+            st.caption(f"垂直反力合計 ΣFz = {total_fz/1000:.3f} kN")
+            st.dataframe(
+                filtered_r.style.format({
+                    "Fx (N)": "{:.2f}", "Fy (N)": "{:.2f}", "Fz (N)": "{:.2f}",
+                    "Mx (N·m)": "{:.2f}", "My (N·m)": "{:.2f}", "Mz (N·m)": "{:.2f}",
+                }),
+                use_container_width=True, hide_index=True,
+            )
+        else:
+            st.info("無支承反力資料。")
+
+    # ── Tab 3 & 4：待實作 ───────────────────────────────────────────────
+    with tab3:
+        st.info("桿件內力摘要（即將實作）")
+    with tab4:
+        st.info("內力圖（即將實作）")
+
+
 def create_structure_plot(nodes_df, elements_df, supports_df=None, reactions=None, rigid_links=None):
     fig = go.Figure()
 
@@ -1649,6 +1722,9 @@ with right_panel:
                 st.success("指紋一致，快取已載入，材料與截面定義已還原。")
 
     output_area = st.empty()
+    if st.session_state.get("last_result"):
+        with output_area.container():
+            _render_result_tabs(st.session_state["last_result"], truss_data)
     res_eval = None
 
     if num_btn:
@@ -1678,8 +1754,9 @@ with right_panel:
                 st.write("組裝剛度矩陣並求解...")
                 res_eval = evaluate_numerical_results(_td_num)
                 _status.update(label=f"數值分析完成（耗時 {res_eval['eval_time_ms']} ms）", state="complete")
-                output_area.json(res_eval)
-                st.info(f"數值分析完成，耗時 {res_eval['eval_time_ms']} ms（直接代入實際參數）。")
+                st.session_state["last_result"] = res_eval
+                with output_area.container():
+                    _render_result_tabs(res_eval, truss_data)
             except Exception as e:
                 _status.update(label="分析失敗", state="error")
                 if "singular" in str(e).lower() or "not invertible" in str(e).lower():
@@ -1754,8 +1831,9 @@ with right_panel:
                 sections=st.session_state["sections"],
                 include_self_weight=include_sw,
             )
-            output_area.json(res_eval)
-            st.info(f"快速代入完成，耗時 {res_eval['eval_time_ms']} ms（使用快取符號解）。")
+            st.session_state["last_result"] = res_eval
+            with output_area.container():
+                _render_result_tabs(res_eval, truss_data)
         except Exception as e:
             st.error(f"代入失敗：{e}")
 
@@ -1797,7 +1875,9 @@ with right_panel:
                 st.write("代入數值並整理結果...")
                 res = st.session_state["sym_cache"]["raw_result"]
                 _status.update(label=f"符號解分析完成（耗時 {res_eval['eval_time_ms']} ms）", state="complete")
-                output_area.json(res_eval)
+                st.session_state["last_result"] = res_eval
+                with output_area.container():
+                    _render_result_tabs(res_eval, truss_data)
             except Exception as e:
                 import traceback as _tb
                 _status.update(label="分析失敗", state="error")
