@@ -298,11 +298,11 @@ def _render_result_tabs(res_eval, truss_data):
         if not disp_df.empty:
             all_nids = [str(r) for r in disp_df["節點 ID"]]
             sel_nids = st.multiselect("篩選節點 ID", all_nids, default=all_nids, key="tab1_node_filter")
-            filtered = disp_df[disp_df["節點 ID"].astype(str).isin(sel_nids)] if sel_nids else disp_df
+            filtered = disp_df[disp_df["節點 ID"].astype(str).isin(sel_nids)] if sel_nids else pd.DataFrame(columns=disp_df.columns)
             # 摘要
             max_uz_row = disp_df.loc[disp_df["uz (m)"].abs().idxmax()]
             st.caption(
-                f"最大垂直位移 |uz| = {abs(max_uz_row['uz (m)'])*1000:.3f} mm（節點 {max_uz_row['節點 ID']}）"
+                f"最大垂直位移 |uz|（全域）= {abs(max_uz_row['uz (m)'])*1000:.3f} mm（節點 {max_uz_row['節點 ID']}）"
             )
             st.dataframe(
                 filtered.style.format({
@@ -331,7 +331,7 @@ def _render_result_tabs(res_eval, truss_data):
         if not react_df.empty:
             all_rnids = [str(r) for r in react_df["節點 ID"]]
             sel_rnids = st.multiselect("篩選節點 ID", all_rnids, default=all_rnids, key="tab2_node_filter")
-            filtered_r = react_df[react_df["節點 ID"].astype(str).isin(sel_rnids)] if sel_rnids else react_df
+            filtered_r = react_df[react_df["節點 ID"].astype(str).isin(sel_rnids)] if sel_rnids else pd.DataFrame(columns=react_df.columns)
             total_fz = react_df["Fz (N)"].sum()
             st.caption(f"垂直反力合計 ΣFz = {total_fz/1000:.3f} kN")
             st.dataframe(
