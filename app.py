@@ -187,6 +187,97 @@ def _extract_val(v):
         return 0.0
 
 
+def _sort_member_elements(elem_forces, truss_data):
+    """
+    依拓撲鏈排序同一 member 的桿件，並附加 _x_offset（累積弧長）。
+    無法形成唯一鏈時退回按 element_id 排序。
+    """
+    node_map = {
+        _norm_id(str(n["id"])): n
+        for n in truss_data.get("nodes", [])
+    }
+    elem_map = {
+        _norm_id(str(e["id"])): e
+        for e in truss_data.get("elements", [])
+    }
+
+    def _elem_len(eid):
+        e = elem_map.get(_norm_id(str(eid)), {})
+        ni = node_map.get(_norm_id(str(e.get("i", ""))), {})
+        nj = node_map.get(_norm_id(str(e.get("j", ""))), {})
+        if not ni or not nj:
+            return 0.0
+        return math.sqrt(
+            (float(nj.get("x", 0)) - float(ni.get("x", 0))) ** 2 +
+            (float(nj.get("y", 0)) - float(ni.get("y", 0))) ** 2 +
+            (float(nj.get("z", 0)) - float(ni.get("z", 0))) ** 2
+        )
+
+    # 建立節點連接圖 (node_id -> list of eid)
+    from collections import defaultdict
+    node_edges = defaultdict(list)
+    eid_to_ij = {}
+    for ef in elem_forces:
+        eid = str(ef["element_id"])
+        e = elem_map.get(_norm_id(eid), {})
+        i_id = _norm_id(str(e.get("i", "")))
+        j_id = _norm_id(str(e.get("j", "")))
+        if i_id and j_id:
+            node_edges[i_id].append(eid)
+            node_edges[j_id].append(eid)
+            eid_to_ij[eid] = (i_id, j_id)
+
+    # 找度數為 1 的端點（鏈起點）
+    degree = {nid: len(eids) for nid, eids in node_edges.items()}
+    endpoints = [nid for nid, d in degree.items() if d == 1]
+    # 按節點座標排序，確保從幾何上最小的端點出發（x→y→z）
+    endpoints.sort(key=lambda nid: (
+        float(node_map.get(nid, {}).get("x", 0)),
+        float(node_map.get(nid, {}).get("y", 0)),
+        float(node_map.get(nid, {}).get("z", 0)),
+    ))
+
+    ordered = []
+    if len(endpoints) >= 1:
+        # 貪婪遍歷
+        start = endpoints[0]
+        visited_eids = set()
+        cur_node = start
+        while True:
+            next_eid = None
+            for eid in node_edges.get(cur_node, []):
+                if eid not in visited_eids:
+                    next_eid = eid
+                    break
+            if next_eid is None:
+                break
+            visited_eids.add(next_eid)
+            i_id, j_id = eid_to_ij.get(next_eid, ("", ""))
+            next_node = j_id if i_id == cur_node else i_id
+            ef_match = next((ef for ef in elem_forces if _norm_id(str(ef["element_id"])) == _norm_id(next_eid)), None)
+            if ef_match:
+                ordered.append(ef_match)
+            cur_node = next_node
+
+    # 若排序結果不完整，退回按 element_id 排序
+    if len(ordered) != len(elem_forces):
+        ordered = sorted(elem_forces, key=lambda ef: (
+            not str(ef["element_id"]).lstrip("-").isdigit(),
+            str(ef["element_id"])
+        ))
+
+    # 附加累積弧長偏移
+    offset = 0.0
+    result = []
+    for ef in ordered:
+        ef2 = dict(ef)
+        ef2["_x_offset"] = offset
+        Le = ef.get("Le", _elem_len(ef["element_id"]))
+        offset += float(Le)
+        result.append(ef2)
+    return result
+
+
 def create_structure_plot(nodes_df, elements_df, supports_df=None, reactions=None, rigid_links=None):
     fig = go.Figure()
 
