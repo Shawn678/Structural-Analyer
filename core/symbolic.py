@@ -67,7 +67,7 @@ def build_local_stiffness_3d_np(eal, gj,
     k[4,4]=k[10,10]=ei22_4; k[4,10]=k[10,4]=ei22_2
     return k
 
-def _assemble_K_np(truss_data, E_s, A_s, I_s, G_s):
+def _assemble_K_np(truss_data, E_s, A_s, I_s, G_s, _tag="", force_2d: str | None = None):
     """用指定材料參數組裝全域剛度矩陣，回傳 (K_np, elements_info, nodes_coords, free_dofs)。"""
     node_list      = truss_data['nodes']
     n_nodes        = len(node_list)
@@ -120,12 +120,16 @@ def _assemble_K_np(truss_data, E_s, A_s, I_s, G_s):
         both_hinged = pin_i and pin_j
 
         # Per-element properties, fall back to sampling scalar when not specified
-        elem_E  = _to_float(elem.get('E',   E_s),  E_s)
-        elem_A  = _to_float(elem.get('A',   A_s),  A_s)
-        elem_I  = _to_float(elem.get('I33', elem.get('I', I_s)), I_s)
-        elem_I22= _to_float(elem.get('I22', elem_I), elem_I)
-        elem_J  = _to_float(elem.get('J',   2.0 * elem_I), 2.0 * elem_I)
-        elem_G  = _to_float(elem.get('G',   G_s),  G_s)
+        # Note: fillna(0) in app.py may set missing props to 0; treat 0 as missing
+        def _ep(val, fb):
+            v = _to_float(val, fb)
+            return v if v != 0.0 else fb
+        elem_E  = _ep(elem.get('E'),   E_s)
+        elem_A  = _ep(elem.get('A'),   A_s)
+        elem_I  = _ep(elem.get('I33', elem.get('I')), I_s)
+        elem_I22= _ep(elem.get('I22'), elem_I)
+        elem_J  = _ep(elem.get('J'),   2.0 * elem_I)
+        elem_G  = _ep(elem.get('G'),   G_s)
 
         eal = elem_E * elem_A / Le
         gj  = elem_G * elem_J / Le
@@ -182,15 +186,18 @@ def _assemble_K_np(truss_data, E_s, A_s, I_s, G_s):
                 pass
 
     # 邊界條件
+    # force_2d="XZ" → 強制套用 XZ 平面面外約束；force_2d="XY" → XY 平面；None → 自動偵測
     is_flat_y = all(abs(c[1]) < 1e-7 for c in nodes_coords)
     is_flat_z = all(abs(c[2]) < 1e-7 for c in nodes_coords)
+    _apply_flat_z = (force_2d == "XY") or (force_2d is None and is_flat_z)
+    _apply_flat_y = (force_2d == "XZ") or (force_2d is None and is_flat_y and not is_flat_z)
     fixed_dofs: set = set()
-    if is_flat_z:
+    if _apply_flat_z:
         # 結構在 XY 平面（z=0），固定面外自由度 uz, rx, ry
         for idx in range(n_nodes):
             fixed_dofs.update({NDOF*idx+2, NDOF*idx+3, NDOF*idx+4})
-    elif is_flat_y:
-        # 2D 結構建在 XZ 平面（所有節點 y=0），自動補全面外約束：uy, rx, rz
+    elif _apply_flat_y:
+        # 2D 結構在 XZ 平面，補全面外約束：uy, rx, rz
         for idx in range(n_nodes):
             fixed_dofs.update({NDOF*idx+1, NDOF*idx+3, NDOF*idx+5})
 
@@ -211,6 +218,13 @@ def _assemble_K_np(truss_data, E_s, A_s, I_s, G_s):
             fixed_dofs.add(i)
 
     free_dofs = [d for d in range(total_dof) if d not in fixed_dofs]
+    _zero_diag = sum(1 for i in range(total_dof) if abs(K_np[i,i])<1e-20)
+    print(f"[K_ASSEMBLE{_tag}] total_dof={total_dof}, fixed={len(fixed_dofs)}, free={len(free_dofs)}, is_flat_y={is_flat_y}, is_flat_z={is_flat_z}, zero_diag={_zero_diag}")
+    if _zero_diag == total_dof and elements_info:
+        e0 = elements_info[0]
+        r0 = truss_data['elements'][0]
+        print(f"[K_ASSEMBLE{_tag}] WARNING: K全零！節點座標前3={nodes_coords[:3]}, Le樣本={[round(e['Le'],4) for e in elements_info[:3]]}")
+        print(f"[K_ASSEMBLE{_tag}] elem[0] raw keys={list(r0.keys())}, E={r0.get('E')}, A={r0.get('A')}, I33={r0.get('I33')}, section={r0.get('section')}")
     return K_np, elements_info, nodes_coords, free_dofs
 
 
@@ -373,7 +387,7 @@ def run_symbolic_analysis(truss_data: dict, section_group_map: dict | None = Non
     G_base = E_base / 2.6
 
     K_base, elements_info, nodes_coords, free_dofs = _assemble_K_np(
-        truss_data, E_base, A_base, I_base, G_base
+        truss_data, E_base, A_base, I_base, G_base, _tag="[SYM]"
     )
 
     # ── Rigid Link 前處理 ─────────────────────────────────────────────────
@@ -657,12 +671,15 @@ def run_symbolic_analysis(truss_data: dict, section_group_map: dict | None = Non
 
         # 若有 rigid link，先凝縮 K_s；否則直接切 submatrix
         if s_idx == 0:
-            print(f"[SAMPLE0] free_dofs={len(free_dofs)}, master_free_cols={len(master_free_cols)}, F_P_np_free max={np.max(np.abs(F_P_np_free)):.3e}, F_w_np_free max={np.max(np.abs(F_w_np_free)):.3e}, has_P={has_P_load}, has_w={has_w_load}")
+            _fp_max = float(np.max(np.abs(F_P_np_free))) if F_P_np_free.size > 0 else 0.0
+            _fw_max = float(np.max(np.abs(F_w_np_free))) if F_w_np_free.size > 0 else 0.0
+            print(f"[SAMPLE0] free_dofs={len(free_dofs)}, master_free_cols={len(master_free_cols)}, F_P_np_free max={_fp_max:.3e}, F_w_np_free max={_fw_max:.3e}, has_P={has_P_load}, has_w={has_w_load}")
         if rigid_links:
             F_zero_s = np.zeros(total_dof)
             K_cond_s, _, _ = apply_rigid_links(K_s, F_zero_s, node_list, rigid_links)
             K_red = K_cond_s[np.ix_(master_free_cols, master_free_cols)]
         else:
+            K_cond_s = K_s
             K_red = K_s[np.ix_(free_s_no_slave, free_s_no_slave)]
 
         F_P_s = F_P_np_free
@@ -1012,7 +1029,7 @@ def _elem_dofs(ni: int, nj: int, ndof: int = 6) -> list:
 # 純數值分析（第二階段：直接代入實際參數求解）
 # ==============================================================================
 
-def run_numerical_analysis(truss_data: dict) -> dict:
+def run_numerical_analysis(truss_data: dict, force_2d: str | None = "auto") -> dict:
     """
     直接使用 truss_data 內的實際 E/A/I/G/Le 與載重數值求解。
     不做符號擬合，結果為純數值。
@@ -1025,8 +1042,10 @@ def run_numerical_analysis(truss_data: dict) -> dict:
     total_dof      = NDOF * n_nodes
 
     # 以實際各桿件截面參數組裝剛度矩陣（_assemble_K_np 內部已逐桿讀取 E/A/I33/I22/J/G）
+    # "auto" → 沿用幾何自動偵測；"3D" → 不套用任何面外約束；"XZ"/"XY" → 強制2D
+    _f2d = None if force_2d == "auto" else (None if force_2d == "3D" else force_2d)
     K_np, elements_info, nodes_coords, free_dofs = _assemble_K_np(
-        truss_data, E_s=200e9, A_s=1e-3, I_s=1e-5, G_s=77e9
+        truss_data, E_s=200e9, A_s=1e-3, I_s=1e-5, G_s=77e9, _tag="[NUM]", force_2d=_f2d
         # 這些 fallback 值只在桿件未設定對應欄位時生效；
         # 桿件有 E/A/I33/G 時 _assemble_K_np 會優先使用桿件值。
     )
@@ -1108,7 +1127,9 @@ def run_numerical_analysis(truss_data: dict) -> dict:
         _free_cols = [_all_no_slave.index(d) for d in free_dofs_no_slave]
         K_red = K_cond[np.ix_(_free_cols, _free_cols)]
         F_red = F_cond[_free_cols]
-        print(f"[NUM] free_dofs_no_slave={len(free_dofs_no_slave)}, F_red max={np.max(np.abs(F_red)):.3e}, F_np max={np.max(np.abs(F_np)):.3e}")
+        _fr_max = float(np.max(np.abs(F_red))) if F_red.size > 0 else 0.0
+        _fn_max = float(np.max(np.abs(F_np))) if F_np.size > 0 else 0.0
+        print(f"[NUM] free_dofs_no_slave={len(free_dofs_no_slave)}, F_red max={_fr_max:.3e}, F_np max={_fn_max:.3e}")
         U_full = np.zeros(total_dof)
         if len(free_dofs_no_slave) > 0 and np.any(np.abs(F_red) > 1e-30):
             U_red = np.linalg.solve(K_red, F_red)
@@ -1222,8 +1243,16 @@ def run_numerical_analysis(truss_data: dict) -> dict:
                 support_reactions.append(entry)
             entry[keys[dof_off]] = float(R_fixed[ii])
 
+    _active_free_dofs = free_dofs_no_slave if _rl_num else free_dofs
+    print(f"[NUM_RET] _rl_num={bool(_rl_num)}, free_dofs={len(free_dofs)}, _active_free_dofs={len(list(_active_free_dofs))}")
     return {
-        "node_displacements": node_displacements,
-        "element_forces":     element_forces,
-        "support_reactions":  support_reactions,
+        "node_displacements":  node_displacements,
+        "element_forces":      element_forces,
+        "support_reactions":   support_reactions,
+        "K_red_diagonal":      K_red.diagonal().tolist(),
+        "free_dofs":           list(_active_free_dofs),
+        "node_id_to_idx":      {k: v for k, v in node_id_to_idx.items()},
+        "nodes_coords":        [list(c) for c in nodes_coords],
+        "elements_info_lite":  [{"id": e["id"], "nodes": list(e["nodes"]), "Le": float(e["Le"])}
+                                 for e in elements_info],
     }

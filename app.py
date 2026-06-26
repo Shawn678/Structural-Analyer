@@ -24,6 +24,23 @@ from core.parametric_evaluator import (
     import_cache_from_txt,
 )
 from core.materials import compute_section_props, expand_truss_data, compute_self_weight
+from core import seismic_bridge as _sb
+import os as _os
+import pandas as _pd
+_SEISMIC_CSV = _os.path.join(_os.path.dirname(__file__), "data", "工址反應譜.csv")
+
+@st.cache_data(show_spinner=False)
+def _load_seismic_spectrum(path: str):
+    df = _pd.read_csv(path, encoding='utf-8-sig', header=None, names=['Key', '475年', '2500年'])
+    params = df.iloc[0:23].set_index('Key')
+    match_start = df[df['Key'].str.contains("長週期不受限制", na=False)]
+    match_end   = df[df['Key'].str.contains("長週期受限制",   na=False)]
+    start_idx = match_start.index[0] + 1
+    end_idx   = match_end.index[0]
+    spec_df = df.iloc[start_idx:end_idx].copy()
+    spec_df = spec_df.apply(_pd.to_numeric, errors='coerce').dropna()
+    spec_df.columns = ['T', 'Sa_475', 'Sa_2500']
+    return params, spec_df
 
 @st.cache_data(show_spinner=False)
 def _compute_fingerprint(nodes_json: str, elements_json: str, supports_json: str):
@@ -74,6 +91,16 @@ if "sym_cache" not in st.session_state:
     st.session_state["sym_cache"] = {}
 if "rigid_links" not in st.session_state:
     st.session_state["rigid_links"] = []
+if "seismic_pier_selection" not in st.session_state:
+    st.session_state["seismic_pier_selection"] = []
+if "seismic_extracted" not in st.session_state:
+    st.session_state["seismic_extracted"] = None
+if "seismic_user_table" not in st.session_state:
+    st.session_state["seismic_user_table"] = None
+if "seismic_result" not in st.session_state:
+    st.session_state["seismic_result"] = None
+if "seismic_bridge_axis" not in st.session_state:
+    st.session_state["seismic_bridge_axis"] = "X"
 if "materials" not in st.session_state:
     st.session_state["materials"] = [
         {"name": "鋼材",   "E": 200e9, "G": 77e9, "density": 7850.0},
@@ -907,6 +934,18 @@ with left_panel:
                 st.rerun()
             except Exception as ex:
                 st.error(f"計算失敗：{ex}")
+
+    # 分析維度設定
+    if "structure_dim" not in st.session_state:
+        st.session_state["structure_dim"] = "auto"
+    _dim_choice = st.radio(
+        "分析維度",
+        ["自動偵測", "2D（XZ 平面）", "2D（XY 平面）", "3D"],
+        index={"auto": 0, "XZ": 1, "XY": 2, "3D": 3}.get(st.session_state["structure_dim"], 0),
+        horizontal=True,
+        help="2D 模式會自動補全面外自由度約束；3D 模式完全忠於邊界條件輸入。純梁橋請選「2D（XZ 平面）」。",
+    )
+    st.session_state["structure_dim"] = {"自動偵測": "auto", "2D（XZ 平面）": "XZ", "2D（XY 平面）": "XY", "3D": "3D"}[_dim_choice]
 
     st.subheader("節點 (Nodes)")
     st.caption("座標單位：**m（公尺）**")
@@ -1891,12 +1930,37 @@ with right_panel:
                 st.success("指紋一致，快取已載入，材料與截面定義已還原。")
 
     output_area = st.empty()
-    if st.session_state.get("last_result"):
+    _any_analysis_btn = num_btn or fast_btn or run_btn
+    if st.session_state.get("last_result") and not _any_analysis_btn:
         with output_area.container():
             _render_result_tabs(st.session_state["last_result"], truss_data)
     res_eval = None
 
     if num_btn:
+        # 截面完整性驗證：數值分析前確認所有被使用的截面都有有效 A
+        _sec_map_chk = {s["name"]: s for s in st.session_state.get("sections", [])}
+        _bad_secs = []
+        for _elem in st.session_state.get("elements_data", []):
+            _sn = _elem.get("section", "")
+            if not _sn:
+                continue
+            _sec = _sec_map_chk.get(_sn, {})
+            _shape = _sec.get("shape", "Custom")
+            try:
+                _props = compute_section_props(_shape, _sec)
+                _A_eff = float(_elem.get("A") or 0) or _props.get("A", 0)
+            except Exception:
+                _A_eff = 0.0
+            if _A_eff <= 0 and _sn not in _bad_secs:
+                _bad_secs.append(_sn)
+        if _bad_secs:
+            st.error(
+                f"數值分析中止：以下截面缺少幾何參數（A=0），"
+                f"請至左側「截面」區塊選取截面並點擊「計算並填入」後再分析：\n\n"
+                + "\n".join(f"- **{s}**" for s in _bad_secs)
+            )
+            st.stop()
+
         with st.status("數值分析中...", expanded=True) as _status:
             try:
                 st.write("建立結構模型...")
@@ -1921,7 +1985,7 @@ with right_panel:
                         else:
                             _td_num["loads"].append({"node_id": _nid, "fz": _nl["fz"]})
                 st.write("組裝剛度矩陣並求解...")
-                res_eval = evaluate_numerical_results(_td_num)
+                res_eval = evaluate_numerical_results(_td_num, force_2d=st.session_state.get("structure_dim", "auto"))
                 _status.update(label=f"數值分析完成（耗時 {res_eval['eval_time_ms']} ms）", state="complete")
                 st.session_state["last_result"] = res_eval
                 with output_area.container():
@@ -2031,3 +2095,371 @@ with right_panel:
         # 純輸入預覽
         fig = create_structure_plot(nodes_df, elements_df, supports_df, rigid_links=_rl_state)
         st.plotly_chart(fig, use_container_width=True, key="struct_plot_preview")
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Tab 5 — 地震力分析
+# ══════════════════════════════════════════════════════════════════════════════
+st.divider()
+st.header("🌋 地震力分析（MDOF）")
+
+_last = st.session_state.get("last_result")
+_has_fem = bool(_last and "K_red_diagonal" in _last)
+
+if not _has_fem:
+    st.info("請先執行 **FEM 數值分析**，才能進行地震力計算。")
+else:
+    _seismic_tabs = st.tabs(["⚙️ 輸入設定", "📊 模態分析", "🌋 地震力與載重組合"])
+
+    # ── 子 Tab A：輸入設定 ─────────────────────────────────────────────────
+    with _seismic_tabs[0]:
+        st.subheader("橋墩識別與參數設定")
+
+        # 收集所有非空 member 名稱
+        _all_members = sorted({
+            (e.get("member") or "").strip()
+            for e in st.session_state.get("elements_data", [])
+            if (e.get("member") or "").strip()
+        })
+
+        if not _all_members:
+            st.warning("元素表中尚無 member 標記。請在元素表的「構件」欄位填入橋墩群組名稱後再回來。")
+        else:
+            col_a1, col_a2 = st.columns([2, 1])
+            with col_a1:
+                _pier_sel = st.multiselect(
+                    "選擇橋墩構件群組（可複選）",
+                    options=_all_members,
+                    default=st.session_state["seismic_pier_selection"],
+                    key="_seismic_pier_sel_widget",
+                    help="只選取**橋墩（垂直構件）**的 member 群組；橋面構件不要選入。"
+                )
+                st.session_state["seismic_pier_selection"] = _pier_sel
+            with col_a2:
+                _axis = st.radio(
+                    "橋軸方向（縱向）",
+                    ["X 軸", "Y 軸"],
+                    index=0 if st.session_state["seismic_bridge_axis"] == "X" else 1,
+                    help="選擇橋梁縱向對應的全域座標軸，用於萃取側向勁度。",
+                )
+                st.session_state["seismic_bridge_axis"] = "X" if _axis == "X 軸" else "Y"
+
+            # SDL 附加靜載倍率
+            if "seismic_sdl_ratio" not in st.session_state:
+                st.session_state["seismic_sdl_ratio"] = 0.0
+            st.session_state["seismic_sdl_ratio"] = st.number_input(
+                "SDL 附加靜載倍率",
+                min_value=0.0, max_value=5.0, step=0.05,
+                value=float(st.session_state["seismic_sdl_ratio"]),
+                format="%.2f",
+                help="附加靜載（非結構質量）佔結構自重的比例。"
+                     "例如 0.20 代表 SDL = 20% 自重。最終質量 = 自重質量 × (1 + 倍率)。",
+            )
+
+            if _pier_sel:
+                if st.button("🔍 從 FEM 提取質量與勁度", type="primary"):
+                    try:
+                        _pier_tops = _sb.identify_pier_tops(
+                            _pier_sel,
+                            st.session_state.get("elements_data", []),
+                            truss_data,
+                        )
+                        _masses = _sb.extract_pier_masses(
+                            _pier_tops,
+                            st.session_state.get("elements_data", []),
+                            truss_data,
+                            st.session_state.get("sections", []),
+                            st.session_state.get("materials", []),
+                        )
+                        # 縱向勁度（橋軸方向）與橫向勁度（垂直橋軸水平方向）
+                        _long_axis = st.session_state["seismic_bridge_axis"]       # "X" or "Y"
+                        _lat_axis  = "Y" if _long_axis == "X" else "X"
+                        _stiffs_L = _sb.extract_pier_stiffnesses(_pier_tops, _last, bridge_axis=_long_axis)
+                        _stiffs_T = _sb.extract_pier_stiffnesses(_pier_tops, _last, bridge_axis=_lat_axis)
+                        _warnings = _sb.validate_mdof_assumptions(
+                            _pier_tops, truss_data, _last, _stiffs_L
+                        )
+
+                        # 組成可編輯表格（SDL 倍率套用在自重質量上）
+                        import pandas as pd
+                        _sdl = float(st.session_state.get("seismic_sdl_ratio", 0.0))
+                        _rows = []
+                        for _pn in _pier_sel:
+                            if _pn not in _pier_tops:
+                                continue
+                            _m_sw = _masses.get(_pn, {}).get("mass_Mg", 0)
+                            _rows.append({
+                                "橋墩":           _pn,
+                                "頂點節點":        _pier_tops[_pn]["top_node"],
+                                "質量 (Mg)":       round(_m_sw * (1 + _sdl), 4),
+                                f"縱向勁度 {_long_axis} (kN/m)": round(_stiffs_L.get(_pn, {}).get("stiffness_kNm", 0), 2),
+                                f"橫向勁度 {_lat_axis} (kN/m)": round(_stiffs_T.get(_pn, {}).get("stiffness_kNm", 0), 2),
+                            })
+                        st.session_state["seismic_extracted"] = {
+                            "pier_tops": _pier_tops,
+                            "masses":    _masses,
+                            "stiffs_L":  _stiffs_L,
+                            "stiffs_T":  _stiffs_T,
+                            "long_axis": _long_axis,
+                            "lat_axis":  _lat_axis,
+                        }
+                        st.session_state["seismic_user_table"] = pd.DataFrame(_rows)
+                        st.session_state["seismic_warnings"] = _warnings
+                        st.success("提取完成！請確認下方表格數值，可直接修改後再執行分析。")
+                    except Exception as _e:
+                        import traceback
+                        st.error(f"提取失敗：{_e}")
+                        st.code(traceback.format_exc())
+
+        # 顯示驗證警告
+        for _w in st.session_state.get("seismic_warnings", []):
+            if _w["level"] == "error":
+                st.error(_w["message"])
+            else:
+                st.warning(_w["message"])
+
+        # 可編輯質量/勁度表
+        if st.session_state["seismic_user_table"] is not None:
+            st.subheader("橋墩參數（可手動修改）")
+            import pandas as pd
+            _edited = st.data_editor(
+                st.session_state["seismic_user_table"],
+                column_config={
+                    "橋墩":       st.column_config.TextColumn("橋墩", disabled=True),
+                    "頂點節點":   st.column_config.TextColumn("頂點節點", disabled=True),
+                    "質量 (Mg)":  st.column_config.NumberColumn("質量 (Mg)",  min_value=0.0, format="%.4f"),
+                    "勁度 (kN/m)": st.column_config.NumberColumn("勁度 (kN/m)", min_value=0.0, format="%.2f"),
+                },
+                use_container_width=True,
+                hide_index=True,
+                key="seismic_table_editor",
+            )
+            st.session_state["seismic_user_table"] = _edited
+
+        # 地震參數輸入
+        st.subheader("地震設計參數")
+        _c1, _c2, _c3 = st.columns(3)
+        with _c1:
+            _mode_label = st.selectbox("分析等級", ["L1", "475年", "2500年"], index=1)
+        with _c2:
+            _i_coeff = st.number_input("用途係數 I", value=1.2, min_value=1.0, max_value=1.5, step=0.1)
+        with _c3:
+            _alpha_y = st.number_input("起始降伏放大倍數 αy", value=1.0, min_value=0.1, step=0.1)
+        _c4, _c5 = st.columns(2)
+        with _c4:
+            _r_val = st.number_input("韌性容量 R", value=2.0, min_value=1.0, step=0.5)
+        with _c5:
+            _analysis_dir = st.selectbox("計算方向", ["縱向與橫向均計算", "僅縱向", "僅橫向"])
+
+        st.session_state["seismic_params"] = {
+            "mode_label": _mode_label,
+            "i_coeff":    _i_coeff,
+            "alpha_y":    _alpha_y,
+            "r_val":      _r_val,
+            "analysis_dir": _analysis_dir,
+        }
+
+    # ── 子 Tab B：模態分析 ─────────────────────────────────────────────────
+    with _seismic_tabs[1]:
+        st.subheader("MDOF 模態分析結果")
+
+        if st.session_state["seismic_user_table"] is None:
+            st.info("請先在「輸入設定」頁面提取橋墩參數。")
+        else:
+            if st.button("▶ 執行模態分析", type="primary"):
+                try:
+                    from core import seismic_logic as _sl
+
+                    _df_tbl = st.session_state["seismic_user_table"]
+                    _ext    = st.session_state.get("seismic_extracted", {})
+                    _long_ax = _ext.get("long_axis", "X")
+                    _lat_ax  = _ext.get("lat_axis",  "Y")
+                    _L_col = f"縱向勁度 {_long_ax} (kN/m)"
+                    _T_col = f"橫向勁度 {_lat_ax} (kN/m)"
+
+                    _masses_list   = _df_tbl["質量 (Mg)"].tolist()
+                    _stiffs_L_list = _df_tbl[_L_col].tolist() if _L_col in _df_tbl.columns else []
+                    _stiffs_T_list = _df_tbl[_T_col].tolist() if _T_col in _df_tbl.columns else []
+
+                    if any(m <= 0 for m in _masses_list):
+                        st.error("質量值必須大於 0，請確認橋墩參數。")
+                    else:
+                        _results = {}
+                        if _stiffs_L_list and all(k > 0 for k in _stiffs_L_list):
+                            _results["L"] = _sl.calculate_mdof_periods(_masses_list, _stiffs_L_list)
+                        if _stiffs_T_list and all(k > 0 for k in _stiffs_T_list):
+                            _results["T"] = _sl.calculate_mdof_periods(_masses_list, _stiffs_T_list)
+                        st.session_state["seismic_result"] = _results
+                        st.success("模態分析完成！")
+                except Exception as _e:
+                    import traceback
+                    st.error(f"模態分析失敗：{_e}")
+                    st.code(traceback.format_exc())
+
+            _mdof_results = st.session_state.get("seismic_result")
+            if _mdof_results:
+                import pandas as pd
+                import plotly.graph_objects as go
+                _ext     = st.session_state.get("seismic_extracted", {})
+                _long_ax = _ext.get("long_axis", "X")
+                _lat_ax  = _ext.get("lat_axis",  "Y")
+
+                for _dir_key, _dir_label in [("L", f"縱向（{_long_ax}）"), ("T", f"橫向（{_lat_ax}）")]:
+                    _res = _mdof_results.get(_dir_key)
+                    if _res is None:
+                        st.warning(f"{_dir_label} 勁度為 0，跳過模態分析。")
+                        continue
+                    st.markdown(f"**{_dir_label} 模態**")
+                    _mode_rows = [{"模態": _m.mode_number, "T (s)": round(_m.period, 4),
+                                   "Γ": round(_m.gamma, 4), "M_eff (Mg)": round(_m.m_eff, 3),
+                                   "M_eff 比 (%)": round(_m.m_eff_ratio, 1)} for _m in _res.modes]
+                    st.dataframe(pd.DataFrame(_mode_rows), use_container_width=True, hide_index=True)
+
+                # 主導模態 info（縱向）
+                _res_L = _mdof_results.get("L")
+                if _res_L:
+                    _dom = max(_res_L.modes, key=lambda m: m.m_eff_ratio)
+                    st.info(
+                        f"**縱向主導模態**：模態 {_dom.mode_number}　｜　"
+                        f"T_L = **{_dom.period:.4f} s**　｜　"
+                        f"有效質量比 = **{_dom.m_eff_ratio:.1f}%**"
+                    )
+                _res_T = _mdof_results.get("T")
+                if _res_T:
+                    _dom_t = max(_res_T.modes, key=lambda m: m.m_eff_ratio)
+                    st.info(
+                        f"**橫向主導模態**：模態 {_dom_t.mode_number}　｜　"
+                        f"T_T = **{_dom_t.period:.4f} s**　｜　"
+                        f"有效質量比 = **{_dom_t.m_eff_ratio:.1f}%**"
+                    )
+
+    # ── 子 Tab C：地震力與載重組合 ────────────────────────────────────────
+    with _seismic_tabs[2]:
+        st.subheader("設計地震力")
+        st.info("ℹ️ 目前地震力分析**僅適用於正交橋**（支承線垂直橋軸）。斜交橋的縱橫向耦合效應尚未處理，請自行確認適用性。")
+
+        _mdof_results = st.session_state.get("seismic_result")
+        _params       = st.session_state.get("seismic_params", {})
+        _df_tbl       = st.session_state.get("seismic_user_table")
+
+        if not _mdof_results or _df_tbl is None:
+            st.info("請先完成「輸入設定」與「模態分析」步驟。")
+        else:
+            try:
+                from core import seismic_logic as _sl3
+                from core.seismic_logic import Mode as _Mode
+
+                # 載入工址反應譜
+                _df_params, _df_spec = _load_seismic_spectrum(_SEISMIC_CSV)
+
+                _mode_label = _params.get("mode_label", "475年")
+                _i_coeff    = _params.get("i_coeff", 1.2)
+                _alpha_y    = _params.get("alpha_y", 1.0)
+                _r_val      = _params.get("r_val", 2.0)
+                _dir        = _params.get("analysis_dir", "縱向與橫向均計算")
+
+                _mode_enum = {"L1": _Mode.L1, "475年": _Mode.LEVEL_475, "2500年": _Mode.LEVEL_2500}[_mode_label]
+                _site_p = _sl3.get_site_params(_mode_enum, _df_params)
+                _ss_val = _sl3.get_ss_for_mode(_mode_enum, _df_params)
+
+                # 縱向/橫向主導模態週期（各自取有效質量比最高者）
+                _res_L = _mdof_results.get("L")
+                _res_T = _mdof_results.get("T")
+                _T_L = max(_res_L.modes, key=lambda m: m.m_eff_ratio).period if _res_L else 0.0
+                _T_T = max(_res_T.modes, key=lambda m: m.m_eff_ratio).period if _res_T else _T_L
+
+                # 總重量（kN）
+                _W_total_kN = float(_df_tbl["質量 (Mg)"].sum()) * 9.81
+
+                # 上部結構重（橋面 tributary）vs 下部結構重（墩柱自重）
+                _extracted  = st.session_state.get("seismic_extracted", {})
+                _masses_raw = _extracted.get("masses", {})
+                _sdl_r      = float(st.session_state.get("seismic_sdl_ratio", 0.0))
+                _W_sup_kN = sum(v.get("deck_mass_Mg", 0) for v in _masses_raw.values()) * 9.81 * (1 + _sdl_r)
+                _W_sub_kN = sum(v.get("pier_mass_Mg", 0) for v in _masses_raw.values()) * 9.81 * (1 + _sdl_r)
+
+                # 縱橫週期耦合警告（兩個方向都有結果才比較）
+                if _res_L and _res_T and _T_T > 0 and 0.8 <= _T_L / _T_T <= 1.2:
+                    st.warning(
+                        f"⚠️ 縱向週期 T_L={_T_L:.3f}s 與橫向週期 T_T={_T_T:.3f}s 相近"
+                        f"（比值 {_T_L/_T_T:.2f}），兩模態方向辨識可能不可靠，"
+                        "建議確認模態振型或調整結構設計。"
+                    )
+
+                # 計算水平地震力
+                _sa_col = "Sa_2500" if _mode_enum == _Mode.LEVEL_2500 else "Sa_475"
+                _spec_data = _df_spec[["T", _sa_col]].rename(columns={_sa_col: "Sa"}) if _mode_enum != _Mode.L1 else None
+
+                _v_l, _v_t = 0.0, 0.0
+                _sa_l = _sa_t = _fu_l = _fu_t = _cd_l = _cd_t = 0.0
+                _fu_text_l = _fu_text_t = ""
+
+                if _dir in ("縱向與橫向均計算", "僅縱向"):
+                    _sa_l, _fu_l, _cd_l, _v_l, _fu_text_l = _sb.compute_horizontal_force(
+                        _T_L, _mode_enum, _W_total_kN, _i_coeff, _alpha_y, _r_val, _site_p, _spec_data
+                    )
+                if _dir in ("縱向與橫向均計算", "僅橫向"):
+                    _sa_t, _fu_t, _cd_t, _v_t, _fu_text_t = _sb.compute_horizontal_force(
+                        _T_T, _mode_enum, _W_total_kN, _i_coeff, _alpha_y, _r_val, _site_p, _spec_data
+                    )
+
+                # 垂直地震力
+                _vv_res = _sl3.calculate_vertical_seismic_force(
+                    _W_sup_kN, _W_sub_kN, _i_coeff, _alpha_y, _ss_val
+                )
+
+                # 顯示主要結果
+                st.markdown("#### 水平設計地震力")
+                _mc1, _mc2, _mc3, _mc4 = st.columns(4)
+                _mc1.metric("縱向 T_L (s)", f"{_T_L:.4f}")
+                _mc2.metric("縱向 Sa", f"{_sa_l:.4f} g" if _v_l else "—")
+                _mc3.metric("縱向 Cd", f"{_cd_l:.4f}" if _v_l else "—")
+                _mc4.metric("縱向 V_L (kN)", f"{_v_l:.1f}" if _v_l else "—")
+
+                _mc5, _mc6, _mc7, _mc8 = st.columns(4)
+                _mc5.metric("橫向 T_T (s)", f"{_T_T:.4f}")
+                _mc6.metric("橫向 Sa", f"{_sa_t:.4f} g" if _v_t else "—")
+                _mc7.metric("橫向 Cd", f"{_cd_t:.4f}" if _v_t else "—")
+                _mc8.metric("橫向 V_T (kN)", f"{_v_t:.1f}" if _v_t else "—")
+
+                st.markdown("#### 垂直設計地震力")
+                _vc1, _vc2, _vc3 = st.columns(3)
+                _vc1.metric("上部結構 Vv_sup (kN)", f"{_vv_res.Vv_sup:.1f}")
+                _vc2.metric("下部結構 Vv_sub (kN)", f"{_vv_res.Vv_sub:.1f}")
+                _vc3.metric("垂直合計 Vv (kN)",     f"{_vv_res.Vv_total:.1f}")
+
+                # 載重組合
+                st.markdown("#### 載重組合（規範 2.7 節）")
+                st.warning(
+                    "⚠️ 目前載重組合為**總地震力直接疊加**（V_L、V_T、V_v 純量組合），"
+                    "尚未依規範 2.7 節將地震力施加回結構並提取**構材內力**後再組合。"
+                    "下表數值僅供確認地震力量值參考，不可直接用於構材設計。"
+                )
+                _combo_res = _sl3.calculate_load_combinations(_v_l, _v_t, _vv_res.Vv_total)
+                import pandas as pd
+                _combo_rows = []
+                for _cb in _combo_res.combinations:
+                    _combo_rows.append({
+                        "組合":     _cb.name,
+                        "公式":     _cb.formula,
+                        "合計 (kN)": round(_cb.total, 1),
+                    })
+                _df_combo = pd.DataFrame(_combo_rows)
+
+                # 控制組合加粗（用 st.dataframe + column_config 無法直接加粗，改用 markdown 表格）
+                _ctrl_name = _combo_res.max_combo.name
+                _md_rows = ["| 組合 | 公式 | 合計 (kN) |", "|---|---|---|"]
+                for _cb in _combo_res.combinations:
+                    _bold = "**" if _cb.name == _ctrl_name else ""
+                    _md_rows.append(
+                        f"| {_bold}{_cb.name}{_bold} | {_bold}{_cb.formula}{_bold} | "
+                        f"{_bold}{_cb.total:.1f}{_bold} |"
+                    )
+                st.markdown("\n".join(_md_rows))
+                st.success(f"✅ 控制組合：**{_ctrl_name}**，合計 {_combo_res.max_combo.total:.1f} kN")
+
+                # TODO: 注入節點載重 — 待確認規範施力點位與方向後實作
+
+            except Exception as _e:
+                import traceback
+                st.error(f"地震力計算失敗：{_e}")
+                st.code(traceback.format_exc())

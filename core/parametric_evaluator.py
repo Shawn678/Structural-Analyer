@@ -298,13 +298,14 @@ def evaluate_real_results(
     }
 
 
-def evaluate_numerical_results(truss_data: dict) -> dict:
+def evaluate_numerical_results(truss_data: dict, force_2d: str | None = "auto") -> dict:
     """
     第二階段數值分析：直接使用 truss_data 內的實際 E/A/I/G/L 與載重數值求解。
     不依賴符號快取，每次呼叫均重新計算。
+    force_2d: "auto"（幾何自動偵測）/"3D"（不套面外約束）/"XZ"/"XY"（強制2D）
     """
     t0 = time.time()
-    raw = run_numerical_analysis(truss_data)
+    raw = run_numerical_analysis(truss_data, force_2d=force_2d)
     eval_ms = int((time.time() - t0) * 1000)
     raw["eval_time_ms"] = eval_ms
     return raw
